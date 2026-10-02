@@ -31,7 +31,7 @@ rules:
           - pattern: $S.$EXEC($QUERY, ...)
           - metavariable-regex:
               metavariable: $EXEC
-              regex: ^(executeQuery|executeUpdate|executeLargeUpdate|execute|addBatch|prepareStatement|prepareCall|nativeSQL|createQuery|createNativeQuery|queryForList|queryForObject|queryForMap|update)$
+              regex: ^(executeQuery|executeUpdate|executeLargeUpdate|execute|addBatch|prepareStatement|prepareCall|nativeSQL|createQuery|createNativeQuery|queryForList|queryForObject|queryForMap|update|query|batchUpdate)$
           - focus-metavariable: $QUERY
 
   - id: bop.java.path-traversal.tainted-path

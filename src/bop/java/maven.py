@@ -59,12 +59,17 @@ class Maven:
         return workdir / "target" / "surefire-reports"
 
     def prepare(self, workdir: Path) -> TestRun:
-        """Resolve everything online once, then record the baseline suite."""
+        """Resolve everything online once, then record the baseline suite.
+
+        Runs the same ``test`` lifecycle that later runs offline. ``dependency:go-offline`` is not
+        used: it fails on projects with artifacts outside Maven Central and still misses
+        plugins that only resolve during the real lifecycle.
+        """
         self.repo.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(self._reports_dir(workdir), ignore_errors=True)
         result = self._run(
             "prepare",
-            self._argv("dependency:go-offline", "test", "-Dmaven.test.failure.ignore=true", offline=False),
+            self._argv("test", "-Dmaven.test.failure.ignore=true", offline=False),
             workdir,
             network=True,
             timeout_s=self.prepare_timeout_s,

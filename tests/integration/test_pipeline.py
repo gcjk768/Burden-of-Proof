@@ -107,7 +107,7 @@ def test_only_dependency_resolution_had_network(finished_run):
     _, db, _ = finished_run
     jobs = db.execute("SELECT purpose, network FROM runner_jobs").fetchall()
     online = [j["purpose"] for j in jobs if j["network"]]
-    assert online == ["mvn dependency:go-offline"]
+    assert online == ["mvn test"]
     assert any(j["purpose"].startswith("semgrep") for j in jobs)
 
 

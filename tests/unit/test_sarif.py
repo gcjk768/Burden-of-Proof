@@ -33,3 +33,9 @@ def test_grouping_merges_rules_on_the_same_statement(fixtures):
     groups = group_findings([*findings, duplicate])
     assert len(groups) == 3
     assert max(len(g.members) for g in groups) == 2
+
+
+def test_sql_sinks_cover_jdbc_and_spring():
+    text = default_rules().read_text()
+    for sink in ("executeQuery", "prepareStatement", "query", "queryForList", "update", "batchUpdate", "createQuery"):
+        assert f"|{sink}|" in text or f"({sink}|" in text or f"|{sink})" in text, sink
