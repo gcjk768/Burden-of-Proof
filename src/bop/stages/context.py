@@ -44,6 +44,13 @@ class RunContext:
     def tools(self) -> RepoTools:
         return RepoTools(self.workdir)
 
+    def scrub(self, text: str) -> str:
+        """Build output with the run's own paths removed. It goes back into prompts, and a path that
+        changes every run would stop cached replies from ever matching again."""
+        for path in sorted({str(self.workdir.resolve()), str(self.workdir)}, key=len, reverse=True):
+            text = text.replace(path + "/", "").replace(path, ".")
+        return text
+
     def group_dir(self, group_id: str) -> Path:
         path = self.run_dir / "groups" / group_id
         path.mkdir(parents=True, exist_ok=True)

@@ -34,6 +34,7 @@ def ingest(ctx: RunContext) -> list[FindingGroup]:
     # IDs come from the code, so the same repository scanned twice would collide; scope them to the run.
     token = hashlib.sha256(ctx.run_id.encode()).hexdigest()[:6]
     for group in groups:
+        group.public_id = group.id
         group.id = f"{group.id}-{token}"
         for f in group.members:
             f.id = f"{f.id}-{token}"

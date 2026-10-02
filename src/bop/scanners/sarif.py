@@ -142,6 +142,12 @@ class FindingGroup:
     id: str
     category: str
     members: list[Finding]
+    public_id: str = ""  # the ID before run scoping; models only ever see this one
+
+    @property
+    def prompt_id(self) -> str:
+        """The ID shown to models. It stays the same across runs, so cached replies keep matching."""
+        return self.public_id or self.id
 
     @property
     def primary(self) -> Finding:

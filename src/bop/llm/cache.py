@@ -50,7 +50,8 @@ class ResponseCache:
             return None
 
     def delete(self, key: str) -> None:
-        self._path(key).unlink(missing_ok=True)
+        if self.writable:  # a read-only replay never changes what was recorded
+            self._path(key).unlink(missing_ok=True)
 
     def put(self, key: str, request: dict[str, Any], response: dict[str, Any]) -> Path | None:
         if not self.writable:

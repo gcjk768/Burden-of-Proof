@@ -10,7 +10,7 @@ from bop.errors import ModelOutputError
 from bop.java.surefire import classify_proof
 from bop.llm.schemas import AnalysisVerdict, ProofTest
 from bop.llm.structured import ask_structured
-from bop.repo.edits import place_proof_test
+from bop.repo.edits import place_proof_test, write_proof_test
 from bop.repo.snapshot import remove_file_and_empty_parents
 from bop.scanners.sarif import FindingGroup
 from bop.stages.context import RunContext, build_conventions, file_block, prompt
@@ -83,7 +83,7 @@ def prove(ctx: RunContext, group: FindingGroup, verdict: AnalysisVerdict) -> Pro
         placement = place_proof_test(ctx.workdir, proof, ctx.marker)
         assert placement.path is not None
         placement.path.parent.mkdir(parents=True, exist_ok=True)
-        placement.path.write_text(proof.source, encoding="utf-8")
+        write_proof_test(ctx.workdir, proof.test_path.lstrip("./"), proof.source)
         saved = ctx.write_artifact(group.id, f"proof-attempt-{attempt}.java", proof.source)
 
         try:
@@ -92,6 +92,7 @@ def prove(ctx: RunContext, group: FindingGroup, verdict: AnalysisVerdict) -> Pro
             remove_file_and_empty_parents(placement.path, ctx.workdir)
             raise
         outcome, detail = classify_proof(run.result, run.cases, proof.test_class, proof.test_method, ctx.marker)
+        detail = ctx.scrub(detail)
         log = ctx.write_artifact(group.id, f"proof-attempt-{attempt}.log", run.result.output_tail(60_000))
         ctx.store.add_proof_test(
             group_id=group.id,

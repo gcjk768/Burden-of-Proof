@@ -54,25 +54,20 @@ def ask_structured[T: BaseModel](
             if fallback is not None:
                 return fallback
             raise
-        hard_ok = False
         try:
             value = model.model_validate(extract_json(result.content))
             problems = check(value) if check else []
-            if not problems:
-                hard_ok = True
-                if soft_check and attempt < retries:
-                    # Soft problems (such as evidence that does not match the code) earn one more try,
-                    # but never sink an otherwise valid reply: callers record them instead.
-                    problems = soft_check(value)
-                    if problems:
-                        fallback = (value, result)
+            if not problems and soft_check and attempt < retries:
+                # Soft problems (such as evidence that does not match the code) earn one more try,
+                # but never sink an otherwise valid reply: callers record them instead.
+                problems = soft_check(value)
+                if problems:
+                    fallback = (value, result)
         except (ValueError, ValidationError) as exc:
             problems = [str(exc)[:2000]]
         if not problems:
             return value, result
-        forget = getattr(client, "forget", None)
-        if not hard_ok and forget is not None and result.request_hash:
-            forget(result.request_hash)  # do not replay an invalid reply from the cache
+        # A rejected reply stays cached: the retry request embeds it, so a replay needs both.
         if result.finish_reason == "length":
             problems.append("The reply was cut off at the token limit; answer more briefly.")
         conversation = [

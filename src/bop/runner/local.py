@@ -30,6 +30,37 @@ JAIL_FAILURE = 125
 
 # Read-only system paths every command may need: binaries, libraries, certificates, the JDK.
 SYSTEM_PATHS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt")
+# Files under /etc that name resolution, TLS and time zones read. On systemd-resolved hosts (Ubuntu,
+# GitHub Actions) /etc/resolv.conf is a symlink into /run, which the jail does not otherwise expose.
+HOST_CONFIG_FILES = (
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/host.conf",
+    "/etc/nsswitch.conf",
+    "/etc/gai.conf",
+    "/etc/localtime",
+    "/etc/timezone",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/ssl/certs/java/cacerts",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+)
+_NEVER_BIND = ("/proc", "/sys", "/dev")
+
+
+def _under(path: str, prefixes: Sequence[str]) -> bool:
+    return any(path == p or path.startswith(p + "/") for p in prefixes)
+
+
+def link_targets(files: Sequence[str] = HOST_CONFIG_FILES) -> list[str]:
+    """Real files behind symlinked configuration files that live outside the bound system paths."""
+    targets = []
+    for name in files:
+        if not os.path.islink(name):
+            continue
+        real = os.path.realpath(name)
+        if os.path.isfile(real) and not _under(real, SYSTEM_PATHS) and not _under(real, _NEVER_BIND):
+            targets.append(real)
+    return sorted(set(targets))
 
 
 def _limits() -> None:  # runs in the child before exec
@@ -70,7 +101,7 @@ def toolchain_paths() -> list[str]:
         found = shutil.which(tool)
         if found:
             paths.add(str(Path(found).resolve().parent.parent))
-    return sorted(p for p in paths if p and not any(p == s or p.startswith(s + "/") for s in SYSTEM_PATHS))
+    return sorted(p for p in paths if p and not _under(p, SYSTEM_PATHS))
 
 
 class LocalNamespaceRunner:
@@ -105,16 +136,23 @@ class LocalNamespaceRunner:
         readable: Sequence[Path],
         root: str,
     ) -> dict:
+        # The environment is not in the spec: the spec travels in argv, which any local user can read
+        # through /proc/<pid>/cmdline, and HTTPS_PROXY may carry credentials. The jail inherits the
+        # environment from the process instead (/proc/<pid>/environ is readable by the owner only).
         home = env.get("HOME", "/root")
         return {
             "root": root,
             # Fresh, empty tmpfs mounts inside the private root, not the host /tmp.
             "tmpfs": ["/tmp", home] if home not in ("/", "") else ["/tmp"],  # noqa: S108
-            "readable": [*SYSTEM_PATHS, *toolchain_paths(), *(str(Path(p).resolve()) for p in readable)],
+            "readable": [
+                *SYSTEM_PATHS,
+                *link_targets(HOST_CONFIG_FILES),
+                *toolchain_paths(),
+                *(str(Path(p).resolve()) for p in readable),
+            ],
             "writable": [str(cwd.resolve()), *(str(Path(p).resolve()) for p in writable)],
             "cwd": str(cwd.resolve()),
             "network": network,
-            "env": dict(env),
             "argv": list(argv),
         }
 

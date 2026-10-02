@@ -221,7 +221,7 @@ def build_and_exec(spec: dict) -> None:
     os.closerange(3, 1 << 20)  # nothing opened while building the root reaches the command
     os.chdir(spec["cwd"])
     argv = spec["argv"]
-    os.execvpe(argv[0], argv, spec["env"])  # noqa: S606 (replacing this process is the point)
+    os.execvpe(argv[0], argv, dict(os.environ))  # noqa: S606 (replacing this process is the point)
 
 
 def main() -> None:

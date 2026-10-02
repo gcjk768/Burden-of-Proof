@@ -32,7 +32,10 @@ securebits that would hand root its capabilities back. It sets `no_new_privs` an
 descriptors. It confirms all of this through `/proc/self/status` and refuses to run the command if
 anything differs. IPC and UTS namespaces are new too. Tests cover the double-chroot escape, the same
 escape from a nested user namespace with full capabilities, and remounting a read-only path as
-writable. Bubblewrap would do the same job. We kept our own short jail so the sandbox has no extra
+writable. Configuration files that `/etc` links elsewhere, such as `/etc/resolv.conf` pointing into
+`/run` on systemd-resolved hosts, have their real file bound read-only too, or DNS fails on GitHub's
+Ubuntu runners. The command's environment no longer travels in the jail's argument list, which any local
+user can read, because a proxy URL can carry a password. Bubblewrap would do the same job. We kept our own short jail so the sandbox has no extra
 system dependency and every step is tested here.
 
 **Network only for dependency resolution, and the project's tests never run online.** (verification,
@@ -64,8 +67,12 @@ not need an ORM, and one fewer dependency is one fewer thing to break during a h
 
 **argparse, not Typer.** Same reason: four subcommands do not justify a dependency.
 
-**IDs are scoped to the run.** Finding and group IDs come from the code, so they now carry a token
-derived from the run ID. Without it, scanning the same repository twice collided on primary keys.
+**IDs are scoped to the run, but models never see the scoped form.** Finding and group IDs come from
+the code, so in the database they carry a token derived from the run ID. Without it, scanning the same
+repository twice collided on primary keys. The verification pass found that putting the scoped ID in
+prompts made every run's requests different, so the response cache never hit across runs and
+`BOP_CACHE=read` replays failed. Prompts now carry the unscoped ID, and build output fed back to a model
+has the run's work path removed. A test checks that two runs send identical requests.
 
 **The baseline is recorded offline.** Dependencies are resolved online, then the suite runs for the
 first time in the same offline sandbox that later judges patches. Tests that need network access fail
@@ -141,23 +148,31 @@ baseline still passes, and a rescan no longer reports the finding and reports no
 in the files the patch touched. The recorded demo includes a patch that only adds `.normalize()`. That
 silences the scanner, but the proof test still fails, so the patch is rejected.
 
-**Rescans count duplicates.** Identical matches are told apart only by order, so fixing the first of two
-identical lines used to shift the second into its fingerprint. A finding counts as gone when the
-number of matches with its code drops by the number of group members.
+**Rescans count duplicates, and check the finding's own line.** Identical matches are told apart only
+by order, so fixing the first of two identical lines used to shift the second into its fingerprint. A
+finding counts as gone when the number of matches with its code drops by the number of group members,
+and no match with the same rule and code remains at the member's own line, followed through the patch.
+The second rule catches a patch that removes a different identical line and leaves the reported one.
 
 **Patch policy.** The allowed-folder check runs on the resolved path, so `src/main/../test/...` is
 refused, and the proof test is rewritten from its source before it judges each patch. Edits are exact
-search-and-replace blocks that must match once. They may only touch
+search-and-replace blocks that must match once. A search text is tried as written first and with the
+file's Windows line endings only if that finds nothing, so files with mixed endings can be patched. They may only touch
 `src/main/`, may not add suppression comments or annotations, and may not change more than 80 lines.
 A patch is applied all or nothing and rolled back byte for byte after each attempt.
 
 **Proof test policy.** A test must live under `src/test/java` in the package it declares, contain the
-marker, and avoid processes, sockets, URLs, `System.exit`, reflection tricks and sleeps.
+marker, and avoid processes, sockets, URLs, `System.exit`, reflection tricks and sleeps. The location is
+judged on the resolved path, and the file is written without following symlinks. Builds of the target's
+code run between writes and could otherwise redirect the proof test into production code.
 
-**Evidence is checked against the checkout.** Every cited excerpt must appear in code (not comments) at
-the cited lines, allowing three lines of slack and ignoring a copied line-number column. Comments are
-recognised in Java (text blocks included), Kotlin, Groovy and JavaScript, in XML-like files, in SQL, and
-in properties, YAML and shell files. Unverifiable evidence earns one retry. If it still fails, the
+**Evidence is checked against the checkout.** Every cited excerpt must appear at the cited lines,
+allowing three lines of slack and ignoring a copied line-number column when every line has one. Only
+code counts. An excerpt copied exactly from a line that ends in a comment is accepted on its code part,
+and the stored excerpt is that code part, so comments never become evidence. An excerpt with no real
+code left once comments are removed is rejected. Comments are recognised in Java (text blocks
+included), Kotlin, Groovy and JavaScript, in XML-like files, in SQL, and in properties, YAML and shell
+files. Unverifiable evidence earns one retry. If it still fails, the
 verdict is kept but recorded as unverified, which blocks any suppression. One bad excerpt never discards
 a whole triage batch: if the retry comes back cut off, malformed or not at all, the first reply is
 used. That reply passed every hard check and failed only the evidence check, so it stays cached.
@@ -173,10 +188,20 @@ undetermined for a human.
 of the run. Above `BOP_WARN_USD` (default 2 dollars) it stops and asks for `--yes`. `BOP_BUDGET_USD`
 (default 5 dollars) is a hard cap checked before every uncached call.
 
-**Responses are cached on disk by exact request, but only usable ones.** Truncated or empty replies are
-not cached, and a reply that fails validation is removed. `bop doctor --live` never uses the cache.
-If Ultra fails, the rest of the run stays on Super. Persistent 429s stop the run with a clear error. In development the cache is read-write. `BOP_CACHE=read`
-replays only and refuses to spend.
+**Responses are cached on disk by exact request, every one of them.** (verification, 2 Oct 2026) The
+first review asked us to skip truncated, empty and invalid replies. The verification pass showed why
+that was wrong. A retry request embeds the rejected reply, so a replay needs that reply too, and a
+`BOP_CACHE=read` replay even deleted recorded files. Now every parsed reply is cached and nothing is
+removed in read mode. A bad reply cannot get stuck, because callers always answer it with a different
+request (the reply plus feedback), and a replay walks the same conversation turn by turn. To draw fresh
+replies, run with `BOP_CACHE=off` or clear the cache. `bop doctor --live` never uses the cache. In
+development the cache is read-write. `BOP_CACHE=read` replays only and refuses to spend.
+
+**Only a permanent failure moves a stage to its fallback model for the rest of the run.** A 404 (model
+not found) or 409 (model stopped) after the SDK's retries keeps the deep stage on Super for the rest of
+the run. A timeout, connection error or 5xx sends only that one call to Super, and the next call tries
+Ultra again. A persistent 429 stops the run with a clear error instead of switching models, because both
+models draw on the same account limits.
 
 ## Testing
 

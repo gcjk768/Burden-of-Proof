@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,10 +26,22 @@ class AppliedPatch:
     files: list[str] = field(default_factory=list)
     diff: str = ""
     problems: list[str] = field(default_factory=list)
+    before: dict[str, str] = field(default_factory=dict)  # repository-relative path -> text
+    after: dict[str, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
         return not self.problems
+
+    def map_line(self, file: str, line: int) -> int | None:
+        """Where a line of the original file sits after the patch, or None if the patch changed it."""
+        if file not in self.before:
+            return line
+        old, new = self.before[file].splitlines(), self.after[file].splitlines()
+        for tag, i1, i2, j1, _j2 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+            if tag == "equal" and i1 <= line - 1 < i2:
+                return j1 + (line - 1 - i1) + 1
+        return None
 
 
 def _changed_lines(before: str, after: str) -> int:
@@ -56,10 +69,14 @@ def apply_patch(
                 continue
         current = new_contents.get(path, originals[path])
         search, replace = edit.search, edit.replace
-        if "\r\n" in current:  # keep the file's Windows line endings
-            search = search.replace("\r\n", "\n").replace("\n", "\r\n")
-            replace = replace.replace("\r\n", "\n").replace("\n", "\r\n")
         count = current.count(search)
+        if count == 0 and "\r\n" in current and "\n" in search:
+            # The model cannot see carriage returns. Try the search with the file's Windows line
+            # endings, and keep them in the replacement. Files with mixed endings match as written.
+            crlf_search = search.replace("\r\n", "\n").replace("\n", "\r\n")
+            if current.count(crlf_search):
+                search, count = crlf_search, current.count(crlf_search)
+                replace = replace.replace("\r\n", "\n").replace("\n", "\r\n")
         if count != 1:
             applied.problems.append(f"search text occurs {count} times in {edit.file}; it must occur exactly once")
             continue
@@ -77,6 +94,7 @@ def apply_patch(
         checkpoint.remember(path)
         path.write_bytes(content.encode("utf-8"))  # bytes, so line endings stay exactly as they were
         applied.files.append(rel)
+        applied.before[rel], applied.after[rel] = originals[path], content
         diffs.append(
             "".join(
                 difflib.unified_diff(
@@ -139,11 +157,32 @@ def place_proof_test(root: Path, proof: ProofTest, marker: str) -> TestPlacement
     path = None
     if not problems:
         try:
-            path = confined(root, rel)
+            path = _proof_destination(root, rel)
         except PathEscape as exc:
             problems.append(str(exc))
         else:
-            if path.exists():
+            if path.exists() or path.is_symlink():
                 problems.append(f"{rel} already exists; choose a new class name")
                 path = None
     return TestPlacement(path, problems)
+
+
+def _proof_destination(root: Path, rel: str) -> Path:
+    """Where a proof test really lands. A symlinked directory could send it into src/main, so the
+    resolved path is judged, the same way patches are."""
+    path = confined(root, rel)
+    real = relative(root, path)
+    if real != rel or not real.startswith("src/test/java/"):
+        raise PathEscape(f"{rel} resolves to {real}; proof tests must be written under src/test/java/")
+    return path
+
+
+def write_proof_test(root: Path, rel: str, source: str) -> Path:
+    """(Re)write a proof test, refusing symlinks. Builds of the target's code run between writes and
+    could have replaced the file or a parent directory with a link to production code."""
+    path = _proof_destination(root, rel)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o644)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(source.encode("utf-8"))
+    return path

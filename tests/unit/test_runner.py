@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from bop.runner import local
 from bop.runner.base import sandbox_env
 from bop.runner.jail import privilege_state, privileges_dropped
 from bop.runner.local import LocalNamespaceRunner
@@ -173,3 +174,44 @@ def test_read_only_paths_cannot_be_remounted_writable(tmp_path):
     result = runner.run([sys.executable, "-c", probe], cwd=work, timeout_s=30, readable=[shared])
     assert "remount -1" in result.stdout, result.stdout + result.stderr
     assert not (shared / "planted").exists()
+
+
+def test_link_targets_follow_symlinked_config_outside_system_paths(tmp_path):
+    real = tmp_path / "run" / "stub-resolv.conf"
+    real.parent.mkdir()
+    real.write_text("nameserver 127.0.0.53\n")
+    link = tmp_path / "etc" / "resolv.conf"
+    link.parent.mkdir()
+    link.symlink_to(real)
+    plain = tmp_path / "etc" / "hosts"
+    plain.write_text("127.0.0.1 localhost\n")
+    to_proc = tmp_path / "etc" / "mtab"
+    to_proc.symlink_to("/proc/self/mounts")
+    assert local.link_targets([str(link), str(plain), str(to_proc), str(tmp_path / "missing")]) == [str(real)]
+
+
+@needs_namespaces
+def test_symlinked_resolv_conf_is_readable_in_the_sandbox(tmp_path, monkeypatch):
+    # The systemd-resolved layout: /etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf
+    real = tmp_path / "run" / "stub-resolv.conf"
+    real.parent.mkdir()
+    real.write_text("nameserver 127.0.0.53\n")
+    etc = tmp_path / "etc"
+    etc.mkdir()
+    (etc / "resolv.conf").symlink_to(real)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.setattr(local, "HOST_CONFIG_FILES", (str(etc / "resolv.conf"),))
+    result = runner.run(["cat", str(etc / "resolv.conf")], cwd=work, timeout_s=30, network=True, readable=[etc])
+    assert "nameserver 127.0.0.53" in result.stdout, result.stderr
+
+
+@needs_namespaces
+def test_proxy_credentials_reach_the_command_but_not_its_argv(tmp_path):
+    secret = "http://alice:S3cretProxyPass@proxy.example:3128"
+    spec = runner._spec(["true"], tmp_path, True, {"HTTPS_PROXY": secret, "HOME": "/root"}, [], [], str(tmp_path))
+    assert secret not in " ".join(runner._command(spec, True))
+    result = runner.run(
+        ["sh", "-c", 'echo "$HTTPS_PROXY"'], cwd=tmp_path, timeout_s=30, network=True, env={"HTTPS_PROXY": secret}
+    )
+    assert secret in result.stdout

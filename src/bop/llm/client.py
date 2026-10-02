@@ -149,10 +149,11 @@ class TokenFactoryClient:
             return self._chat(route.fallback, messages, schema, tools, context or {}, fallback_from=route.model)
         try:
             return self._chat(route, messages, schema, tools, context or {})
-        except ModelUnavailable:
+        except ModelUnavailable as exc:
             if route.fallback is None:
                 raise
-            self._down.add(route.model)  # stay on the fallback for the rest of the run
+            if exc.permanent:
+                self._down.add(route.model)  # stay on the fallback for the rest of the run
             return self._chat(route.fallback, messages, schema, tools, context or {}, fallback_from=route.model)
 
     def forget(self, request_hash: str) -> None:
@@ -243,8 +244,10 @@ class TokenFactoryClient:
         result.fallback_from = fallback_from
         result.cost_usd = self.prices.cost(route.model, result.usage.prompt_tokens, result.usage.completion_tokens)
         self.budget.add(result.cost_usd)
-        if result.finish_reason != "length" and (result.content or result.tool_calls):
-            self.cache.put(key, request, _serialise(result))  # never cache a truncated or empty reply
+        # Every reply is cached, cut-off and empty ones included. Callers answer a bad reply with a
+        # different request (the reply plus feedback), so a replay follows the same conversation
+        # turn by turn instead of being stuck on it, and BOP_CACHE=read can replay the whole run.
+        self.cache.put(key, request, _serialise(result))
         self._record(result, route, context, None)
         return result
 
@@ -259,8 +262,10 @@ class TokenFactoryClient:
         if isinstance(exc, openai.APIStatusError):
             if exc.status_code == 402:
                 return BudgetExceeded("Token Factory reports the account budget is exhausted (402)")
-            if exc.status_code in (404, 409) or exc.status_code >= 500:
-                return ModelUnavailable(f"model unavailable ({exc.status_code}): {exc.message}")
+            if exc.status_code in (404, 409):
+                return ModelUnavailable(f"model unavailable ({exc.status_code}): {exc.message}", permanent=True)
+            if exc.status_code >= 500:
+                return ModelUnavailable(f"Token Factory server error ({exc.status_code}): {exc.message}")
             return ModelOutputError(f"Token Factory error {exc.status_code}: {exc.message}")
         if isinstance(exc, (openai.APIConnectionError, openai.APITimeoutError)):
             return ModelUnavailable(f"could not reach Token Factory: {exc}")

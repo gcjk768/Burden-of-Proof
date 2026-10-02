@@ -230,11 +230,11 @@ def test_a_failed_retry_falls_back_to_the_reply_that_failed_only_soft_checks(ret
     assert "h1" not in client.forgotten  # a valid reply stays cached
 
 
-def test_hard_failures_are_forgotten_and_still_raise():
+def test_rejected_replies_stay_cached_and_hard_failures_still_raise():
     client = ForgettingReplies(result("nope", request_hash="h1"), result("still nope", request_hash="h2"))
     with pytest.raises(ModelOutputError):
         ask_structured(client, "triage", [], TriageBatch)
-    assert client.forgotten == ["h1", "h2"]
+    assert client.forgotten == []  # the retry embeds the rejected reply, so a replay needs both
 
 
 # ---------------------------------------------------------------- tools never crash the run
@@ -432,11 +432,29 @@ def client_with(settings, replies, cache_mode="readwrite"):
     return client, calls
 
 
-def test_truncated_replies_are_not_cached(settings):
-    client, calls = client_with(settings, [reply('{"a": ', finish="length"), reply('{"a": 1}')])
-    messages = [{"role": "user", "content": "same"}]
-    client.chat("triage", messages)
-    assert client.chat("triage", messages).content == '{"a": 1}' and len(calls) == 2
+def test_a_read_only_replay_follows_the_recorded_retry_chain(settings):
+    from bop.llm.schemas import ProofTest
+
+    good = (
+        '{"test_path": "src/test/java/a/PTest.java", "test_class": "a.PTest", "test_method": "t", '
+        '"source": "s", "setup_notes": ""}'
+    )
+    recording, calls = client_with(settings, [reply('{"test_path": ', finish="length"), reply(good)])
+    first, _ = ask_structured(recording, "prove", [{"role": "user", "content": "x"}], ProofTest)
+    assert len(calls) == 2
+    files = sorted(settings.cache_dir.rglob("*.json"))
+    replay, replay_calls = client_with(settings, [], cache_mode="read")
+    second, _ = ask_structured(replay, "prove", [{"role": "user", "content": "x"}], ProofTest)
+    assert second == first and replay_calls == []  # both turns, the cut-off one included, came from the cache
+    assert sorted(settings.cache_dir.rglob("*.json")) == files
+
+
+def test_a_read_only_cache_never_deletes(settings):
+    recording, _ = client_with(settings, [reply("first")])
+    first = recording.chat("triage", [{"role": "user", "content": "same"}])
+    replay, _ = client_with(settings, [], cache_mode="read")
+    replay.forget(first.request_hash)
+    assert replay.chat("triage", [{"role": "user", "content": "same"}]).content == "first"
 
 
 def test_forget_drops_a_cached_reply(settings):
@@ -453,6 +471,25 @@ def test_rate_limit_is_its_own_error(settings):
         client.chat("triage", [{"role": "user", "content": "x"}])
 
 
+@pytest.mark.parametrize(
+    "transient", [error(openai.RateLimitError, 429), error(openai.InternalServerError, 502)], ids=["429", "502"]
+)
+def test_transient_errors_do_not_pin_the_run_to_the_fallback(settings, transient):
+    client, calls = client_with(settings, [transient, reply("a"), reply("b")], "off")
+    if isinstance(transient, openai.RateLimitError):
+        with pytest.raises(RateLimited):  # the fallback shares the account's limits; stop instead
+            client.chat("analyze", [{"role": "user", "content": "1"}])
+        assert calls == ["nvidia/Nemotron-3-Ultra-550b-a55b"]
+        return
+    client.chat("analyze", [{"role": "user", "content": "1"}])  # this one call falls back
+    client.chat("analyze", [{"role": "user", "content": "2"}])  # the next tries Ultra again
+    assert calls == [
+        "nvidia/Nemotron-3-Ultra-550b-a55b",
+        "nvidia/nemotron-3-super-120b-a12b",
+        "nvidia/Nemotron-3-Ultra-550b-a55b",
+    ]
+
+
 def test_fallback_sticks_for_the_rest_of_the_run(settings):
     client, calls = client_with(settings, [error(openai.ConflictError, 409), reply("a"), reply("b")], "off")
     client.chat("analyze", [{"role": "user", "content": "1"}])
@@ -462,3 +499,113 @@ def test_fallback_sticks_for_the_rest_of_the_run(settings):
         "nvidia/nemotron-3-super-120b-a12b",
         "nvidia/nemotron-3-super-120b-a12b",
     ]
+
+
+# ---------------------------------------------------------------- second verification pass
+def proof_for(path="src/test/java/com/PwnTest.java", cls="com.PwnTest"):
+    from bop.llm.schemas import ProofTest
+
+    source = 'package com;\nclass PwnTest { @Test void t() { fail("[BOP-PROOF] x"); } }'
+    return ProofTest(test_path=path, test_class=cls, test_method="t", source=source)
+
+
+def test_a_symlinked_test_directory_cannot_send_a_proof_test_into_production_code(repo):
+    from bop.repo.edits import place_proof_test
+
+    (repo / "src/main/java/com").mkdir(parents=True)
+    (repo / "src/test/java/com").symlink_to(repo / "src/main/java/com")
+    placement = place_proof_test(repo, proof_for(), "[BOP-PROOF]")
+    assert placement.path is None and "src/test/java" in placement.problems[0]
+
+
+def test_rewriting_a_proof_test_refuses_a_swapped_in_symlink(repo):
+    from bop.repo.edits import write_proof_test
+    from bop.repo.paths import PathEscape
+
+    target = repo / SRC
+    before = target.read_text()
+    (repo / "src/test/java/a/PTest.java").symlink_to(target)
+    with pytest.raises((PathEscape, OSError)):
+        write_proof_test(repo, "src/test/java/a/PTest.java", "class PTest {}")
+    assert target.read_text() == before
+
+
+def test_mixed_line_endings_match_as_written(tmp_path):
+    root = tmp_path
+    (root / "src/main/java/a").mkdir(parents=True)
+    path = root / SRC
+    path.write_bytes(b"// Copyright\r\npackage a;\nclass A {\n    int x = 1;\n}\n")
+    patch = Patch(
+        edits=[Edit(file=SRC, search="class A {\n    int x = 1;", replace="class A {\n    int x = 2;")], explanation="e"
+    )
+    applied = apply_patch(root, patch, FileCheckpoint(root))
+    assert applied.ok, applied.problems
+    assert path.read_bytes() == b"// Copyright\r\npackage a;\nclass A {\n    int x = 2;\n}\n"
+
+
+def test_removing_a_different_identical_line_is_not_a_fix(tmp_path):
+    from bop.repo.edits import AppliedPatch
+
+    before = "\n".join(["a", "b", "c", "d", "sink(x);", "e", "f", "g", "h", "sink(x);", "i"]) + "\n"
+    after = before.replace("h\nsink(x);\n", "h\n")  # the patch removed line 10, not the group's line 5
+    applied = AppliedPatch(files=["Q.java"], before={"Q.java": before}, after={"Q.java": after})
+    member = f("b", 5)
+    remaining = [f("b", 5)]  # the rescan still reports line 5
+    still, _ = rescan_verdict(
+        Counter({"b": 2}), Counter({"b": 1}), remaining, ["Q.java"], members=[member], line_map=applied.map_line
+    )
+    assert [x.start_line for x in still] == [5]
+    # Fixing line 5 itself (which shifts nothing) is still a fix.
+    fixed_after = before.replace("d\nsink(x);\n", "d\nsafe(x);\n")
+    applied = AppliedPatch(files=["Q.java"], before={"Q.java": before}, after={"Q.java": fixed_after})
+    still, _ = rescan_verdict(
+        Counter({"b": 2}), Counter({"b": 1}), [f("b", 10)], ["Q.java"], members=[member], line_map=applied.map_line
+    )
+    assert still == []
+
+
+EVIDENCE_FILE = '''class A {
+    String q(String id) {
+        String sql = "SELECT * FROM t WHERE id = " + id; // TODO
+        // build the statement
+        return sql;
+    }
+    static final String HELP = """
+        see http://example.com
+        """; // String id = sanitize(id); is safe
+    Object r() {
+        return repo.find(
+            query,
+            100
+        );
+    }
+}
+'''
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "excerpt", "ok"),
+    [
+        (3, 3, 'String sql = "SELECT * FROM t WHERE id = " + id; // TODO', True),  # exact copy with its comment
+        (
+            3,
+            5,
+            'String sql = "SELECT * FROM t WHERE id = " + id; // TODO\n        // build the statement\n'
+            "        return sql;",
+            True,
+        ),  # spans a comment line
+        (8, 8, "see http://example.com", True),  # text-block content is not a comment
+        (11, 14, "return repo.find(\n        query,\n        100\n    );", True),  # numbers at line starts
+        (9, 9, "String id = sanitize(id); is safe", False),  # a comment after a text block
+        (4, 4, "// build the statement", False),  # nothing but a comment
+        (3, 3, "x; // String id = sanitize(id);", False),  # no real code left once the comment goes
+    ],
+)
+def test_evidence_counts_the_code_part_of_an_excerpt(tmp_path, start, end, excerpt, ok):
+    (tmp_path / "A.java").write_text(EVIDENCE_FILE)
+    check = verify(
+        tmp_path, Evidence(role="sink", file="A.java", start_line=start, end_line=end, excerpt=excerpt, why="w")
+    )
+    assert check.ok is ok, check.problem
+    if ok:
+        assert "TODO" not in (check.code or "") and "build the statement" not in (check.code or "")

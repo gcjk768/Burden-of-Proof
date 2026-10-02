@@ -217,3 +217,30 @@ def test_budget_stop_during_triage_keeps_the_batches_already_decided(finished_ru
         (run.run_id,),
     ).fetchone()[0]
     assert suppressions == 1
+
+
+class CapturingClient:
+    """Replays the script and records every request exactly as the cache would key it."""
+
+    def __init__(self):
+        from bop.llm.fake import ScriptedClient
+
+        self.inner = ScriptedClient.from_file(SCRIPT)
+        self.requests: list[str] = []
+
+    def chat(self, stage, messages, **kwargs):
+        from bop.llm.cache import canonical_json
+
+        self.requests.append(canonical_json({"stage": stage, "messages": list(messages)}))
+        return self.inner.chat(stage, messages, **kwargs)
+
+
+def test_two_runs_send_identical_prompts_so_cached_replies_match(finished_run):
+    _, _, _, settings = finished_run
+    first, second = CapturingClient(), CapturingClient()
+    a = Pipeline(settings, log=lambda _: None, llm=first).run(RunOptions(repo=APP, script=SCRIPT))
+    b = Pipeline(settings, log=lambda _: None, llm=second).run(RunOptions(repo=APP, script=SCRIPT))
+    assert a.run_id != b.run_id and a.status == b.status == "done"
+    assert len(first.requests) > 5
+    assert first.requests == second.requests
+    assert not any(a.run_id in r or str(a.run_dir) in r for r in first.requests)

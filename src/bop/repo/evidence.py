@@ -10,7 +10,17 @@ from bop.llm.schemas import Evidence
 from bop.repo.paths import PathEscape, confined
 
 SLACK_LINES = 3  # models are often a line or two off; the excerpt must still match nearby
-_GUTTER = re.compile(r"(?m)^\s*\d+\s{2}")  # the "  42  " line-number column the tools add
+_GUTTER = re.compile(r"^[ \t]*\d+[ \t]{2}")  # the "  42  " line-number column the tools add
+_IDENTIFIER = re.compile(r"[A-Za-z_$][\w$]")
+
+
+def strip_gutter(excerpt: str) -> str:
+    """Remove a copied line-number column, but only when every non-empty line has one."""
+    lines = excerpt.splitlines()
+    filled = [line for line in lines if line.strip()]
+    if filled and all(_GUTTER.match(line) for line in filled):
+        return "\n".join(_GUTTER.sub("", line, count=1) for line in lines)
+    return excerpt
 
 
 def _norm(text: str) -> str:
@@ -86,6 +96,7 @@ class EvidenceCheck:
     problem: str | None = None
     start_line: int | None = None
     end_line: int | None = None
+    code: str | None = None  # the excerpt with comments removed; this is what was verified
 
 
 def verify(root: Path, ev: Evidence) -> EvidenceCheck:
@@ -100,9 +111,17 @@ def verify(root: Path, ev: Evidence) -> EvidenceCheck:
     code_lines = strip_comments(text, path.suffix).splitlines()
     if ev.start_line > len(lines):
         return EvidenceCheck(False, f"{ev.file} has {len(lines)} lines; evidence starts at {ev.start_line}")
-    excerpt = _norm(_GUTTER.sub("", ev.excerpt))
+    raw_excerpt = strip_gutter(ev.excerpt)
+    excerpt = _norm(raw_excerpt)
     if not excerpt:
         return EvidenceCheck(False, f"empty excerpt for {ev.file}:{ev.start_line}")
+    # Only code counts as evidence. An excerpt may include a comment (copied exactly from a line that
+    # ends in one, say), but its code part must be in the code, and there must be some code.
+    code_text = "\n".join(line.rstrip() for line in strip_comments(raw_excerpt, path.suffix).splitlines())
+    code_text = "\n".join(line for line in code_text.splitlines() if line.strip())
+    code = _norm(code_text)
+    if not _IDENTIFIER.search(code):
+        code = ""
     span = max(0, ev.end_line - ev.start_line)
     first = max(1, ev.start_line - SLACK_LINES)
     last = min(len(lines), ev.start_line + SLACK_LINES)
@@ -110,8 +129,11 @@ def verify(root: Path, ev: Evidence) -> EvidenceCheck:
     for start in [ev.start_line, *range(first, last + 1)]:
         end = min(len(lines), start + span)
         if excerpt in _norm("\n".join(lines[start - 1 : end])):
-            if excerpt in _norm("\n".join(code_lines[start - 1 : end])):
-                return EvidenceCheck(True, None, start, end)
+            code_window = _norm("\n".join(code_lines[start - 1 : end]))
+            if excerpt in code_window and _IDENTIFIER.search(excerpt):
+                return EvidenceCheck(True, None, start, end, raw_excerpt)
+            if code and code in code_window:
+                return EvidenceCheck(True, None, start, end, code_text)
             in_comment = True
     if in_comment:
         # Repository text can say anything; only code counts as evidence.

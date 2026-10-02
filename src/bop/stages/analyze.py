@@ -30,7 +30,7 @@ def _unfinished(result: ChatResult) -> str | None:
 
 
 def _investigate(ctx: RunContext, group: FindingGroup, triage: TriageVerdict | None) -> tuple[str, list[Any]]:
-    finding = finding_payload(ctx.workdir, group.id, group.primary)
+    finding = finding_payload(ctx.workdir, group.prompt_id, group.primary)
     intro = {"finding": finding, "triage": triage.model_dump() if triage else None}
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": prompt("analyze")},
@@ -100,8 +100,8 @@ def analyze(ctx: RunContext, group: FindingGroup, triage: TriageVerdict | None) 
 
     def check(v: AnalysisVerdict) -> list[str]:
         problems = check_analysis(v)
-        if v.finding_id != group.id:
-            problems.append(f"finding_id must be {group.id}")
+        if v.finding_id != group.prompt_id:
+            problems.append(f"finding_id must be {group.prompt_id}")
         return problems
 
     def evidence_check(v: AnalysisVerdict) -> list[str]:
@@ -113,14 +113,14 @@ def analyze(ctx: RunContext, group: FindingGroup, triage: TriageVerdict | None) 
             "role": "user",
             "content": json.dumps(
                 {
-                    "finding": finding_payload(ctx.workdir, group.id, group.primary),
+                    "finding": finding_payload(ctx.workdir, group.prompt_id, group.primary),
                     "investigation_notes": notes,
                 },
                 indent=2,
             ),
         },
     ]
-    context = {"key": group.primary.key, "group_id": group.id, "finding_id": group.id}
+    context = {"key": group.primary.key, "group_id": group.id, "finding_id": group.prompt_id}
     try:
         verdict, call = ask_structured(
             ctx.llm,

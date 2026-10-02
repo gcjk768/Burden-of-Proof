@@ -24,7 +24,7 @@ def store_evidence(ctx: RunContext, verdict, checks) -> list[dict]:  # type: ign
                 "file": ev.file,
                 "start_line": check.start_line or ev.start_line,
                 "end_line": check.end_line or ev.end_line,
-                "excerpt": ev.excerpt,
+                "excerpt": check.code if check.ok and check.code else ev.excerpt,
                 "why": ev.why,
                 "verified": int(check.ok),
             }
@@ -40,8 +40,9 @@ def triage(
     verdicts = {} if verdicts is None else verdicts
     for start in range(0, len(groups), BATCH_SIZE):
         batch = list(groups[start : start + BATCH_SIZE])
-        ids = {g.id for g in batch}
-        payload = [finding_payload(ctx.workdir, g.id, g.primary) for g in batch]
+        by_prompt_id = {g.prompt_id: g for g in batch}
+        ids = set(by_prompt_id)
+        payload = [finding_payload(ctx.workdir, g.prompt_id, g.primary) for g in batch]
 
         def check(result: TriageBatch, ids: set[str] = ids) -> list[str]:
             problems = []
@@ -65,7 +66,7 @@ def triage(
             {"role": "system", "content": prompt("triage")},
             {"role": "user", "content": "Findings:\n" + json.dumps(payload, indent=2)},
         ]
-        context = {"findings": [{"id": g.id, "key": g.primary.key} for g in batch]}
+        context = {"findings": [{"id": g.prompt_id, "key": g.primary.key} for g in batch]}
         try:
             result, call = ask_structured(
                 ctx.llm, "triage", messages, TriageBatch, context=context, check=check, soft_check=evidence_check
@@ -80,9 +81,10 @@ def triage(
                 ctx.store.set_group_state(g.id, "stopped", "budget cap reached during triage")
             raise
         for v in result.verdicts:
+            group = by_prompt_id[v.finding_id]
             checks, problems = verify_all(ctx.workdir, v.evidence)
             ctx.store.add_verdict(
-                group_id=v.finding_id,
+                group_id=group.id,
                 stage="triage",
                 model=call.model,
                 verdict=v.verdict,
@@ -96,7 +98,7 @@ def triage(
                 llm_call_id=call.call_id,
                 evidence=store_evidence(ctx, v, checks),
             )
-            ctx.store.set_group_state(v.finding_id, "triaged", v.verdict)
-            verdicts[v.finding_id] = v
-            ctx.log(f"triage: {v.finding_id} {v.verdict} ({v.confidence:.2f}) {v.summary}")
+            ctx.store.set_group_state(group.id, "triaged", v.verdict)
+            verdicts[group.id] = v
+            ctx.log(f"triage: {group.id} {v.verdict} ({v.confidence:.2f}) {v.summary}")
     return verdicts
