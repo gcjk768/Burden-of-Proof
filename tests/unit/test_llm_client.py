@@ -48,13 +48,16 @@ def make_client(settings, replies, *, cache_mode="off", budget=5.0):
     return client, sdks
 
 
-def status_error(code):
+def status_error(code, message="boom"):
     request = httpx.Request("POST", "https://api.example/v1/chat/completions")
     resp = httpx.Response(code, request=request, json={"detail": "x"})
-    cls = {401: openai.AuthenticationError, 409: openai.ConflictError, 404: openai.NotFoundError}.get(
-        code, openai.APIStatusError
-    )
-    return cls("boom", response=resp, body=None)
+    cls = {
+        400: openai.BadRequestError,
+        401: openai.AuthenticationError,
+        409: openai.ConflictError,
+        404: openai.NotFoundError,
+    }.get(code, openai.APIStatusError)
+    return cls(message, response=resp, body=None)
 
 
 def test_triage_request_turns_thinking_off_and_uses_json_schema(settings):
@@ -63,7 +66,7 @@ def test_triage_request_turns_thinking_off_and_uses_json_schema(settings):
     result = client.chat("triage", [{"role": "user", "content": "hi"}], schema=schema)
     request = next(iter(sdks.values())).requests[0]
     assert request["model"] == "nvidia/Nemotron-3_5-Lightning"
-    assert request["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert request["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}, "reasoning_effort": "none"}
     assert request["response_format"]["type"] == "json_schema"
     assert "tools" not in request
     # Lightning is $0.06 in / $0.24 out per million tokens
@@ -76,6 +79,7 @@ def test_analysis_turns_thinking_on_and_sends_tools(settings):
     request = next(iter(sdks.values())).requests[0]
     assert request["model"] == "nvidia/Nemotron-3-Ultra-550b-a55b"
     assert request["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
+    assert "reasoning_effort" not in request["extra_body"]
     assert request["parallel_tool_calls"] is False
 
 
@@ -140,3 +144,47 @@ def test_strip_thinking():
     assert strip_thinking("<think>hmm</think>\n{}") == "{}"
     assert strip_thinking("reasoning...</think>answer") == "answer"
     assert strip_thinking(None) == ""
+
+
+def test_a_server_that_rejects_reasoning_effort_is_retried_without_it(settings):
+    rejected = status_error(400, "Unrecognized request argument supplied: reasoning_effort")
+    client, sdks = make_client(settings, [rejected, response("{}"), response("{}")])
+    client.chat("triage", [{"role": "user", "content": "1"}])
+    client.chat("triage", [{"role": "user", "content": "2"}])
+    requests = next(iter(sdks.values())).requests
+    assert "reasoning_effort" in requests[0]["extra_body"]
+    assert "reasoning_effort" not in requests[1]["extra_body"] and "reasoning_effort" not in requests[2]["extra_body"]
+
+
+def test_other_bad_requests_are_not_retried(settings):
+    client, sdks = make_client(settings, [status_error(400, "messages: field required")])
+    with pytest.raises(ModelOutputError):
+        client.chat("triage", [{"role": "user", "content": "1"}])
+    assert len(next(iter(sdks.values())).requests) == 1
+
+
+def test_a_cut_off_reply_is_retried_once_with_more_tokens_and_thinking_off(settings):
+    client, sdks = make_client(settings, [response('{"a": ', finish="length"), response('{"a": 1}')])
+    result = client.chat("prove", [{"role": "user", "content": "x"}])
+    first, second = next(iter(sdks.values())).requests
+    assert result.content == '{"a": 1}'
+    assert second["max_tokens"] == 2 * first["max_tokens"]
+    assert first["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
+    assert second["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+
+
+def test_a_reply_cut_off_twice_is_returned_as_cut_off(settings):
+    client, sdks = make_client(settings, [response("a", finish="length"), response("ab", finish="length")])
+    result = client.chat("prove", [{"role": "user", "content": "x"}])
+    assert result.finish_reason == "length" and len(next(iter(sdks.values())).requests) == 2
+
+
+def test_reasoning_is_kept_from_the_separate_field_or_leaked_tags(settings):
+    separate = response("answer")
+    separate.choices[0].message.model_extra = {"reasoning_content": "because X"}
+    leaked = response("<think>because Y</think>answer")
+    client, _ = make_client(settings, [separate, leaked])
+    first = client.chat("triage", [{"role": "user", "content": "1"}])
+    second = client.chat("triage", [{"role": "user", "content": "2"}])
+    assert (first.content, first.reasoning) == ("answer", "because X")
+    assert (second.content, second.reasoning) == ("answer", "because Y")

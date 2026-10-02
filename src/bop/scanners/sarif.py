@@ -26,6 +26,8 @@ CWE_CATEGORY = {
     "1395": "vulnerable_dependency",
 }
 LEVEL_SEVERITY = {"error": "high", "warning": "medium", "note": "low", "none": "info"}
+# A Semgrep suppression comment at the end of the matched line ("// nosemgrep: rule", "# nosem").
+_NOSEMGREP = re.compile(r"(?://|#|--|/\*)\s*nosem(?:grep)?\b.*$", re.I | re.M)
 
 
 @dataclass
@@ -45,6 +47,7 @@ class Finding:
     in_scope: bool
     base_fingerprint: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
+    suppressed_in_source: bool = False  # the team already marked it (nosemgrep); reported, not processed
 
     @property
     def key(self) -> str:
@@ -53,7 +56,8 @@ class Finding:
 
 
 def normalise_snippet(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
+    # A nosemgrep comment added later must not change the finding's identity.
+    return re.sub(r"\s+", " ", _NOSEMGREP.sub("", text or "")).strip()
 
 
 def fingerprint(tool: str, rule_id: str, file: str, snippet: str, occurrence: int = 0) -> str:
@@ -112,6 +116,10 @@ def parse_sarif(data: dict[str, Any], *, known_rules: Iterable[str] = ()) -> lis
             occurrence = seen.get(base, 0)
             seen[base] = occurrence + 1
             fp = base if occurrence == 0 else fingerprint(tool, rule_id, file, snippet, occurrence)
+            suppressed = any(
+                s.get("kind") in ("inSource", "external") and s.get("status", "accepted") == "accepted"
+                for s in result.get("suppressions") or []
+            )
             findings.append(
                 Finding(
                     id=f"F-{fp[:12]}",
@@ -126,8 +134,9 @@ def parse_sarif(data: dict[str, Any], *, known_rules: Iterable[str] = ()) -> lis
                     message=(result.get("message", {}) or {}).get("text", ""),
                     snippet=snippet,
                     fingerprint=fp,
-                    in_scope=category in IN_SCOPE,
+                    in_scope=category in IN_SCOPE and not suppressed,
                     base_fingerprint=base,
+                    suppressed_in_source=suppressed,
                 )
             )
     return findings

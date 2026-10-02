@@ -13,7 +13,7 @@ from bop.repo.paths import PathEscape, confined, relative
 from bop.repo.snapshot import FileCheckpoint
 
 MAX_CHANGED_LINES = 80
-SUPPRESSION_MARKERS = re.compile(r"nosemgrep|NOSONAR|@SuppressWarnings|@SuppressFBWarnings|noinspection", re.I)
+SUPPRESSION_MARKERS = re.compile(r"\bnosem(?:grep)?\b|NOSONAR|@SuppressWarnings|@SuppressFBWarnings|noinspection", re.I)
 # Proof tests must stay unit-level: no network, no processes, no reflection tricks on the JVM.
 FORBIDDEN_IN_TESTS = re.compile(
     r"\bRuntime\s*\.\s*getRuntime|\bProcessBuilder\b|\bjava\.net\.|\bSocket\b|\bHttpClient\b|\bURL\s*\("

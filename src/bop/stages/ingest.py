@@ -46,8 +46,8 @@ def ingest(ctx: RunContext) -> list[FindingGroup]:
             category=group.category,
             primary_finding_id=group.primary.id,
             member_count=len(group.members),
-            state="new" if in_scope else "out_of_scope",
-            state_reason=None if in_scope else f"category {group.category} is not in scope yet",
+            state="new" if in_scope else _skipped_state(group),
+            state_reason=None if in_scope else _skipped_reason(group),
         )
         for f in group.members:
             ctx.store.add_finding(
@@ -71,3 +71,13 @@ def ingest(ctx: RunContext) -> list[FindingGroup]:
         f"({sum(g.primary.in_scope for g in groups)} in scope)"
     )
     return groups
+
+
+def _skipped_state(group: FindingGroup) -> str:
+    return "suppressed_in_source" if group.primary.suppressed_in_source else "out_of_scope"
+
+
+def _skipped_reason(group: FindingGroup) -> str:
+    if group.primary.suppressed_in_source:
+        return "already suppressed in the source (nosemgrep); not re-examined"
+    return f"category {group.category} is not in scope yet"

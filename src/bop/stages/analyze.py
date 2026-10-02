@@ -50,6 +50,7 @@ def _investigate(ctx: RunContext, group: FindingGroup, triage: TriageVerdict | N
         transcript.append(
             {
                 "content": result.content,
+                "reasoning": result.reasoning,
                 "tool_calls": [c.__dict__ for c in result.tool_calls],
                 "model": result.model,
                 "call_id": result.call_id,
@@ -76,7 +77,9 @@ def _investigate(ctx: RunContext, group: FindingGroup, triage: TriageVerdict | N
     messages.append({"role": "user", "content": "Stop using tools now and give your conclusion."})
     for _attempt in range(2):
         result = ctx.llm.chat("analyze", messages, context=context)
-        transcript.append({"content": result.content, "model": result.model, "call_id": result.call_id})
+        transcript.append(
+            {"content": result.content, "reasoning": result.reasoning, "model": result.model, "call_id": result.call_id}
+        )
         problem = "You cannot call tools now. Give your conclusion." if result.tool_calls else _unfinished(result)
         if problem is None:
             return result.content, transcript

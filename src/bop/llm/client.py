@@ -6,7 +6,7 @@ import json
 import re
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Protocol
 
 from bop.config import Settings
@@ -17,7 +17,8 @@ from bop.llm.router import Route, Router
 from bop.llm.toolcalls import ToolCall, parse_arguments, parse_text_tool_calls
 
 Message = dict[str, Any]
-_THINK = re.compile(r"<think>.*?</think>", re.S)
+_THINK = re.compile(r"<think>(.*?)</think>", re.S)
+MAX_TOKENS_CAP = 32768  # the most a cut-off reply's single retry may ask for
 
 
 @dataclass
@@ -43,6 +44,7 @@ class ChatResult:
     fallback_from: str | None = None
     call_id: int | None = None
     malformed_tool_call: bool = False
+    reasoning: str = ""  # thinking text the server returned, kept for the audit trail
 
     def assistant_message(self) -> Message:
         """The reply as a message to append to the conversation."""
@@ -72,13 +74,31 @@ class ChatClient(Protocol):
 CallRecorder = Callable[[ChatResult | None, Route, dict[str, Any], str | None], int | None]
 
 
-def strip_thinking(text: str | None) -> str:
+def split_thinking(text: str | None) -> tuple[str, str]:
+    """(answer, thinking) from a reply whose thinking leaked into the content."""
     if not text:
-        return ""
+        return "", ""
+    thoughts = [m.strip() for m in _THINK.findall(text)]
     text = _THINK.sub("", text)
     if "</think>" in text:  # the opening tag was part of the prompt template
-        text = text.split("</think>", 1)[1]
-    return text.strip()
+        before, text = text.split("</think>", 1)
+        thoughts.insert(0, before.strip())
+    return text.strip(), "\n\n".join(t for t in thoughts if t)
+
+
+def strip_thinking(text: str | None) -> str:
+    return split_thinking(text)[0]
+
+
+def _reasoning_field(message: Any) -> str:
+    """The separate reasoning field, under whichever name the server uses today."""
+    extra = getattr(message, "model_extra", None) or {}
+    for name in ("reasoning_content", "reasoning"):
+        value = extra.get(name) if isinstance(extra, dict) else None
+        value = value or getattr(message, name, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 def _serialise(result: ChatResult) -> dict[str, Any]:
@@ -120,14 +140,21 @@ class TokenFactoryClient:
         self._sdk_factory = sdk_factory or self._default_sdk
         self._sdks: dict[str, Any] = {}
         self._down: set[str] = set()
+        # Reported by other Token Factory users: enable_thinking=false alone has not always stopped
+        # Nemotron from reasoning, and adding reasoning_effort="none" did. Dropped for the rest of the
+        # run if the server ever rejects the field.
+        self._send_reasoning_effort = True
 
     def _default_sdk(self, base_url: str) -> Any:
         if not self.settings.api_key:
             raise ConfigError("NEBIUS_API_KEY is not set (put it in .env; see .env.example)")
+        import httpx
         from openai import OpenAI
 
-        # The SDK retries 408/409/429/5xx with backoff and honours Retry-After.
-        return OpenAI(base_url=base_url, api_key=self.settings.api_key, max_retries=4, timeout=600.0)
+        # The SDK retries 408/409/429/5xx with backoff and honours Retry-After. A long read timeout
+        # covers 16k-token replies; a short connect timeout fails fast on a dead host.
+        timeout = httpx.Timeout(600.0, connect=10.0)
+        return OpenAI(base_url=base_url, api_key=self.settings.api_key, max_retries=4, timeout=timeout)
 
     def _sdk(self, base_url: str) -> Any:
         if base_url not in self._sdks:
@@ -188,6 +215,8 @@ class TokenFactoryClient:
             "top_p": route.top_p,
             "extra_body": route.extra_body(),
         }
+        if not route.thinking and self._send_reasoning_effort:
+            request["extra_body"]["reasoning_effort"] = "none"
         if schema is not None:
             request["response_format"] = {
                 "type": "json_schema",
@@ -206,6 +235,26 @@ class TokenFactoryClient:
                 result.call_id = call_id
 
     def _chat(
+        self,
+        route: Route,
+        messages: Sequence[Message],
+        schema: dict[str, Any] | None,
+        tools: Sequence[dict[str, Any]] | None,
+        context: dict[str, Any],
+        fallback_from: str | None = None,
+    ) -> ChatResult:
+        """One call, plus a single retry when the reply was cut off at the token limit.
+
+        The retry doubles max_tokens and turns thinking off, because reasoning that eats the token
+        budget is the usual cause. Both replies are recorded and cached, so a replay takes the same path.
+        """
+        result = self._call(route, messages, schema, tools, context, fallback_from)
+        if result.finish_reason == "length" and not result.tool_calls and route.max_tokens < MAX_TOKENS_CAP:
+            bigger = replace(route, max_tokens=min(route.max_tokens * 2, MAX_TOKENS_CAP), thinking=False)
+            return self._call(bigger, messages, schema, tools, context, fallback_from)
+        return result
+
+    def _call(
         self,
         route: Route,
         messages: Sequence[Message],
@@ -233,6 +282,10 @@ class TokenFactoryClient:
         try:
             response = self._sdk(route.base_url).chat.completions.create(**request)
         except Exception as exc:
+            if self._send_reasoning_effort and "reasoning_effort" in request["extra_body"] and _rejects(exc):
+                self._send_reasoning_effort = False  # this server does not take it; carry on without
+                self._record(None, route, context, f"reasoning_effort rejected, retrying without it: {exc}")
+                return self._call(route, messages, schema, tools, context, fallback_from)
             error = self._classify(exc)
             self._record(None, route, context, f"{type(exc).__name__}: {exc}")
             raise error from exc
@@ -277,7 +330,8 @@ class TokenFactoryClient:
             raise ModelOutputError(f"{route.model} returned no choices")
         choice = response.choices[0]
         message = choice.message
-        content = strip_thinking(getattr(message, "content", None))
+        content, leaked = split_thinking(getattr(message, "content", None))
+        reasoning = _reasoning_field(message) or leaked
         calls = [
             ToolCall(tc.id, tc.function.name, parse_arguments(tc.function.arguments))
             for tc in (getattr(message, "tool_calls", None) or [])
@@ -301,4 +355,11 @@ class TokenFactoryClient:
             ),
             finish_reason=getattr(choice, "finish_reason", None),
             malformed_tool_call=malformed,
+            reasoning=reasoning,
         )
+
+
+def _rejects(exc: Exception) -> bool:
+    """A 400 that names reasoning_effort: the server does not accept the parameter."""
+    status = getattr(exc, "status_code", None)
+    return status in (400, 422) and "reasoning_effort" in str(exc)

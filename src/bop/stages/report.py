@@ -116,6 +116,11 @@ def write_report(ctx: RunContext) -> Path:
             f"| `{r['model']}` | {r['stage']} | {r['calls']} | {r['cached_calls']} | {r['prompt_tokens']:,} "
             f"| {r['completion_tokens']:,} | {r['reasoning_tokens']:,} | ${r['cost_usd']:.4f} |"
         )
+    leaks = store.query(
+        "SELECT COUNT(*) AS n FROM llm_calls WHERE run_id = ? AND thinking = 0 AND reasoning_tokens > 0", (run_id,)
+    )[0]["n"]
+    if leaks:
+        out += ["", f"{leaks} calls asked for thinking off but still reported reasoning tokens."]
     path = ctx.run_dir / "report.md"
     path.write_text("\n".join(out) + "\n", encoding="utf-8")
     return path

@@ -1,4 +1,4 @@
-from bop.scanners.sarif import canonical_rule_id, group_findings, load_sarif
+from bop.scanners.sarif import canonical_rule_id, group_findings, load_sarif, parse_sarif
 from bop.scanners.semgrep import default_rules, rule_ids
 
 KNOWN = ["bop.java.sqli.tainted-query", "bop.java.path-traversal.tainted-path"]
@@ -39,3 +39,44 @@ def test_sql_sinks_cover_jdbc_and_spring():
     text = default_rules().read_text()
     for sink in ("executeQuery", "prepareStatement", "query", "queryForList", "update", "batchUpdate", "createQuery"):
         assert f"|{sink}|" in text or f"({sink}|" in text or f"|{sink})" in text, sink
+
+
+def _result(snippet, suppressions=None):
+    result = {
+        "ruleId": "bop.java.path-traversal.tainted-path",
+        "message": {"text": "m"},
+        "locations": [
+            {
+                "physicalLocation": {
+                    "artifactLocation": {"uri": "src/main/java/R.java"},
+                    "region": {"startLine": 18, "snippet": {"text": snippet}},
+                }
+            }
+        ],
+    }
+    if suppressions is not None:
+        result["suppressions"] = suppressions
+    rules = [{"id": "bop.java.path-traversal.tainted-path", "properties": {"tags": ["CWE-22"]}}]
+    return {"runs": [{"tool": {"driver": {"name": "Semgrep OSS", "rules": rules}}, "results": [result]}]}
+
+
+def test_findings_suppressed_in_source_are_recorded_but_not_in_scope():
+    # The shape Semgrep 1.179 writes for a line ending in "// nosemgrep: <rule>".
+    line = "Path file = baseDir.resolve(reportName); // nosemgrep: bop.java.path-traversal.tainted-path"
+    (finding,) = parse_sarif(_result(line, [{"kind": "inSource"}]))
+    assert finding.suppressed_in_source and not finding.in_scope
+    (plain,) = parse_sarif(_result("Path file = baseDir.resolve(reportName);"))
+    assert plain.in_scope and not plain.suppressed_in_source
+    assert finding.fingerprint == plain.fingerprint  # adding the comment does not change its identity
+
+
+def test_patches_may_not_add_the_short_nosem_marker(tmp_path):
+    from bop.llm.schemas import Edit, Patch
+    from bop.repo.edits import apply_patch
+    from bop.repo.snapshot import FileCheckpoint
+
+    (tmp_path / "src/main/java").mkdir(parents=True)
+    (tmp_path / "src/main/java/R.java").write_text("class R { int x = 1; }\n")
+    edit = Edit(file="src/main/java/R.java", search="int x = 1;", replace="int x = 1; // nosem")
+    applied = apply_patch(tmp_path, Patch(edits=[edit], explanation="e"), FileCheckpoint(tmp_path))
+    assert not applied.ok and "suppression" in applied.problems[0]

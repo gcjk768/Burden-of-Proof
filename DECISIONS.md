@@ -106,12 +106,25 @@ switched per request with `chat_template_kwargs.enable_thinking`. It is off for 
 verdict call, and on for Ultra's investigation and for Super writing tests and patches. `bop doctor
 --live` reports reasoning tokens per model so the switch can be verified on the real endpoint.
 
+**Thinking-off requests also send `reasoning_effort: "none"`.** (2 Oct 2026) Other Token Factory users
+report that `enable_thinking=false` alone has not always stopped Nemotron from reasoning, and that the
+extra field did. We have not seen this first-hand yet. If the server ever rejects the field, the client
+drops it for the rest of the run and retries the call. Every call's reasoning tokens are in the ledger,
+and the report counts thinking-off calls that still reasoned. Reasoning text, whether the server returns
+it in its own field or it leaks into the content as `<think>` tags, is kept in the analysis transcript
+for audit and never shown to the next stage.
+
+**A reply cut off at the token limit gets one retry with twice the tokens and thinking off.** Reasoning
+that eats the token budget is the usual cause, so the retry turns thinking off as well. The cap is 32,768
+tokens. If the retry is cut off too, the stage's own feedback loop handles it.
+
 **Ultra investigates in two steps.** First a tool-using investigation with thinking on, in plain text.
 Then a short thinking-off call turns the notes into the verdict schema. This keeps JSON reliable
 without giving up reasoning where it matters.
 
 **Ultra falls back to Super.** On 404, 409, 5xx or a connection failure after the SDK's own retries,
-the deep stage reruns on Super and the ledger records `fallback_from`. The catalog listed Ultra with
+the deep stage reruns on Super and the ledger records `fallback_from`. Only 404 and 409 keep it on Super
+for the rest of the run (see Cost). The catalog listed Ultra with
 status "error" twice in September 2026.
 
 **Per-role base URL overrides.** The global endpoint serves every model, but Nebius's own examples for
@@ -121,6 +134,12 @@ Super and Ultra use the us-central1 host, so each role can point at its own base
 free in the budget.
 
 ## Scanning
+
+**Findings the team already suppressed are recorded, not re-examined.** Semgrep keeps a match on a line
+marked `nosemgrep` in its SARIF, with an in-source suppression (checked with Semgrep 1.179). Such
+findings are stored with the state `suppressed_in_source` and skipped. A `nosemgrep` comment is removed
+from the snippet before fingerprinting, so adding one does not change a finding's identity. Patches may
+not add `nosemgrep` or its short form `nosem`.
 
 **Our own Semgrep rules, under Apache-2.0.** The Semgrep engine is LGPL and fine to use, but the
 registry rules are under the Semgrep Rules License, which forbids redistribution and offering them as

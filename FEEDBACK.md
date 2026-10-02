@@ -30,6 +30,13 @@ the first session with a key.
   builders measured 8 percent valid JSON from Lightning with thinking on. A prominent note on the
   structured-output page, or thinking off by default whenever `response_format` is set, would save
   every team the same debugging. *(Reported by other builders; to be measured first-hand.)*
+- **Two switches for "thinking off".** Other builders report that `chat_template_kwargs.enable_thinking`
+  alone has not always produced zero reasoning tokens, and that adding `reasoning_effort: "none"` did.
+  One documented, enforced switch, and a `reasoning_tokens` count that is always present in `usage`,
+  would make this verifiable. We send both and log any thinking-off call that still reasons.
+  *(Reported by other builders; to be measured first-hand.)*
+- **The reasoning field moves.** One builder saw reasoning in `reasoning_content` on 18 Sep and inside
+  `content` on 27 Sep 2026 for the same model. We read both. *(Reported by other builders.)*
 - **The catalog does not advertise JSON mode for Nemotron**, although `json_schema` works with thinking
   off. *(Third-party.)*
 - **Regional hosts are easy to get wrong.** Super and Ultra examples use the us-central1 host, and one
