@@ -1,0 +1,3 @@
+# test name, category, real vulnerability, cwe, Benchmark version: 1.2, 2016-06-1
+BenchmarkTest00001,sqli,true,89
+BenchmarkTest00002,sqli,false,89

@@ -1,0 +1,47 @@
+{
+  "model": "scripted",
+  "note": "Recorded triage replies for tests/fixtures/bench-mini: one real SQL injection kept, one parsed-to-int false positive suppressed.",
+  "replies": [
+    {
+      "stage": "triage",
+      "verdicts": {
+        "BenchmarkTest00001.java:7": {
+          "verdict": "likely_real",
+          "confidence": 0.9,
+          "weakness": "sql_injection",
+          "summary": "The parameter is concatenated into the SQL text and executed.",
+          "evidence": [
+            {
+              "role": "propagation",
+              "file": "BenchmarkTest00001.java",
+              "start_line": 5,
+              "end_line": 5,
+              "excerpt": "String sql = \"SELECT * FROM users WHERE name = '\" + param + \"'\";",
+              "why": "param goes into the query text unescaped"
+            }
+          ],
+          "false_positive_reason": null,
+          "reasoning": "Nothing escapes or binds the value."
+        },
+        "BenchmarkTest00002.java:8": {
+          "verdict": "likely_false_positive",
+          "confidence": 0.92,
+          "weakness": "sql_injection",
+          "summary": "The parameter is parsed with Integer.parseInt, so only an integer reaches the query.",
+          "evidence": [
+            {
+              "role": "sanitizer",
+              "file": "BenchmarkTest00002.java",
+              "start_line": 5,
+              "end_line": 5,
+              "excerpt": "int id = Integer.parseInt(param);",
+              "why": "parseInt throws on anything that is not an integer"
+            }
+          ],
+          "false_positive_reason": "sanitized",
+          "reasoning": "An int rendered into SQL cannot carry quotes or keywords."
+        }
+      }
+    }
+  ]
+}

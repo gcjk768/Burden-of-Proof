@@ -31,7 +31,7 @@ rules:
           - pattern: $S.$EXEC($QUERY, ...)
           - metavariable-regex:
               metavariable: $EXEC
-              regex: ^(executeQuery|executeUpdate|executeLargeUpdate|execute|addBatch|prepareStatement|prepareCall|nativeSQL|createQuery|createNativeQuery|queryForList|queryForObject|queryForMap|update|query|batchUpdate)$
+              regex: ^(executeQuery|executeUpdate|executeLargeUpdate|execute|addBatch|prepareStatement|prepareCall|nativeSQL|createQuery|createNativeQuery|createSQLQuery|queryForList|queryForObject|queryForMap|queryForRowSet|queryForStream|queryForInt|queryForLong|update|query|batchUpdate)$
           - focus-metavariable: $QUERY
 
   - id: bop.java.path-traversal.tainted-path
@@ -59,11 +59,18 @@ rules:
       - patterns:
           - pattern-either:
               - pattern: (java.nio.file.Path $BASE).resolve($X)
+              # Either part of a two-part path can carry the traversal: the directory or the name.
+              - pattern: java.nio.file.Paths.get($X, ...)
               - pattern: java.nio.file.Paths.get($BASE, $X, ...)
+              - pattern: java.nio.file.Path.of($X, ...)
               - pattern: java.nio.file.Path.of($BASE, $X, ...)
+              - pattern: new java.io.File($X, ...)
               - pattern: new java.io.File($BASE, $X)
-              - pattern: new java.io.File($X)
               - pattern: new java.io.FileInputStream($X)
+              - pattern: new java.io.FileOutputStream($X, ...)
+              - pattern: new java.io.FileReader($X, ...)
+              - pattern: new java.io.FileWriter($X, ...)
+              - pattern: new java.io.RandomAccessFile($X, $MODE)
           - focus-metavariable: $X
           # The canonical safe pattern: normalise, then reject anything outside the base directory.
           - pattern-not-inside: |

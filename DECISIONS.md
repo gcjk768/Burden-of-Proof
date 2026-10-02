@@ -143,6 +143,13 @@ free in the budget.
 
 ## Scanning
 
+**Benchmark numbers are measured, kept and labelled.** (2 Oct 2026) `bop bench owasp` scores the rules
+on the OWASP Benchmark with our own scorer, and `--triage` scores them again after the real triage stage
+with the real suppression rule. The first measurement is kept even though the rules changed afterwards.
+The standard file and JDBC sinks added after looking at Benchmark misses are labelled as tuned on the
+data they are scored on (`docs/benchmark.md`). The scoring SARIF drops suppressed results because the
+Benchmark's own reader ignores SARIF suppressions.
+
 **Findings the team already suppressed are recorded, not re-examined.** Semgrep keeps a match on a line
 marked `nosemgrep` in its SARIF, with an in-source suppression (checked with Semgrep 1.179). Such
 findings are stored with the state `suppressed_in_source` and skipped. A `nosemgrep` comment is removed

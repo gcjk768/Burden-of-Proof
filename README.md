@@ -82,6 +82,13 @@ pytest tests/unit                     # fast, no Java or network
 pytest tests/integration              # the whole loop on the sample app with real Maven and Semgrep
 ```
 
+Benchmark (no API key needed for the raw scanner score):
+
+```bash
+git clone --depth 1 https://github.com/OWASP-Benchmark/BenchmarkJava.git
+bop bench owasp BenchmarkJava         # writes raw.sarif and score.md under $BOP_HOME/bench/
+```
+
 ## Status
 
 What works today, verified by the test suite:
@@ -90,16 +97,17 @@ What works today, verified by the test suite:
 - **Triage, analysis, proof and fix.** On the sample app, the SQL injection is traced across three files and proven by a failing JUnit test. It is then fixed with a prepared statement after one rejected patch. The path traversal is proven and fixed. The false positive is suppressed with verified evidence.
 - **Safety checks.** A patch that only silences the scanner is rejected because the proof test still fails. Every build, test and scan runs in Linux namespaces with a private root and no capabilities, so code under test cannot see the project's `.env`, the run database or the home directory, and cannot climb out of the jail. Only dependency resolution has network access, and the project's own tests never run during it. Each target repository gets its own Maven repository.
 - **Cost controls.** Every model call is recorded with tokens and cost, and runs stop at the budget cap.
+- **First benchmark baseline.** `bop bench owasp` scores the raw Semgrep rules on the OWASP Benchmark. Without triage they barely beat guessing (Benchmark score +0.069 for SQL injection and +0.066 for path traversal, with recall of 0.923 and 0.940), which is the gap triage has to close. Full table and method in [docs/benchmark.md](docs/benchmark.md).
 
 Not yet done:
 
 - **No live run yet.** No call has reached Token Factory from the build environment, because its network policy blocks the Token Factory hosts.
-- **Later milestones.** The Token Factory Sandboxes runner, dependency upgrades with Tavily and OSV, GitLab merge requests, the dashboard and the benchmark numbers are still to come.
+- **Later milestones.** The Token Factory Sandboxes runner, dependency upgrades with Tavily and OSV, GitLab merge requests, the dashboard and the benchmark numbers after triage are still to come.
 
 | Week | Goal | State |
 |---|---|---|
 | 1 (to 11 Oct) | Skeleton, Token Factory client with routing and cost tracking, scanner ingest, first finding through the whole loop | Done, replay only |
-| 2 (to 18 Oct) | Sandboxes runner, deep analysis on Ultra, full loop on a deliberately vulnerable Java app, first triage benchmark numbers | Next |
+| 2 (to 18 Oct) | Sandboxes runner, deep analysis on Ultra, full loop on a deliberately vulnerable Java app, first triage benchmark numbers | Started: raw scanner baseline measured |
 | 3 (to 25 Oct) | Dependency upgrades with Tavily and OSV, GitLab merge requests, dashboard, final benchmark numbers | |
 | 4 (to 29 Oct) | Hosted demo with sample mode, documentation, demo video | |
 

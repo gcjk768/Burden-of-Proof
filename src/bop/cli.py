@@ -1,4 +1,4 @@
-"""Command line: bop doctor | scan | run | show."""
+"""Command line: bop doctor | scan | run | show | bench."""
 
 from __future__ import annotations
 
@@ -137,6 +137,113 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _git_head(repo: Path) -> str:
+    """The checked-out commit, read from .git directly (no git command runs inside the clone)."""
+    head = repo / ".git" / "HEAD"
+    if not head.is_file():
+        return "unknown"
+    ref = head.read_text(encoding="utf-8").strip()
+    if not ref.startswith("ref: "):
+        return ref
+    target = repo / ".git" / ref[5:]
+    if target.is_file():
+        return target.read_text(encoding="utf-8").strip()
+    packed = repo / ".git" / "packed-refs"
+    if packed.is_file():
+        for line in packed.read_text(encoding="utf-8").splitlines():
+            if line.endswith(" " + ref[5:]):
+                return line.split()[0]
+    return "unknown"
+
+
+def cmd_bench_owasp(args: argparse.Namespace) -> int:
+    import hashlib
+    from datetime import UTC, datetime
+    from importlib.metadata import PackageNotFoundError, version
+
+    from bop.bench.owasp import flagged_cases, load_expected, render, score
+    from bop.runner.local import make_runner
+    from bop.scanners.semgrep import default_rules, run_semgrep
+
+    bench = Path(args.benchmark).resolve()
+    testcode = bench / "src" / "main" / "java" / "org" / "owasp" / "benchmark" / "testcode"
+    expected_file = bench / "expectedresults-1.2.csv"
+    if not testcode.is_dir() or not expected_file.is_file():
+        raise BopError(f"{bench} does not look like a BenchmarkJava checkout (testcode or expectedresults missing)")
+    settings = load_settings()
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    out = Path(args.out).resolve() if args.out else settings.home / "bench" / f"owasp-{stamp}"
+    work = out / "testcode"
+    if work.exists():
+        raise BopError(f"{work} already exists; choose another --out")
+    out.mkdir(parents=True, exist_ok=True)
+    # Scan a copy, so the sandbox never gets write access to the user's clone.
+    shutil.copytree(
+        testcode, work, symlinks=True, ignore=lambda d, names: [n for n in names if (Path(d) / n).is_symlink()]
+    )
+    rules = default_rules()
+    expected = load_expected(expected_file)
+    try:
+        semgrep_version = version("semgrep")
+    except PackageNotFoundError:
+        semgrep_version = "unknown"
+    header = [
+        "# OWASP Benchmark score",
+        "",
+        f"- Date (UTC): {stamp}",
+        f"- Benchmark: BenchmarkJava commit `{_git_head(bench)}`, `expectedresults-1.2.csv`",
+        f"- Scanner: Semgrep {semgrep_version} with `{rules.name}` "
+        f"(sha256 `{hashlib.sha256(rules.read_bytes()).hexdigest()[:16]}`)",
+    ]
+    if not args.triage:
+        runner = make_runner(allow_unsandboxed=settings.allow_unsandboxed)
+        result = run_semgrep(runner, work, out / "raw.sarif", rules=rules, timeout_s=args.timeout)
+        if not result.ok:
+            raise BopError(f"Semgrep failed: {result.run.output_tail(1500)}")
+        header += [f"- Results: {len(result.findings)}", "- Triage: none (raw scanner results)", ""]
+        report = "\n".join(header) + render(score(expected, flagged_cases(result.findings)), "Raw Semgrep results")
+    else:
+        from bop.bench.triage_run import scoring_sarif, triage_benchmark
+
+        bt = triage_benchmark(
+            settings,
+            work,
+            out / "run",
+            script=Path(args.script).resolve() if args.script else None,
+            yes=args.yes,
+            estimate_only=args.estimate_only,
+            max_groups=args.limit,
+        )
+        if bt.raw_sarif and bt.raw_sarif.is_file():
+            shutil.copyfile(bt.raw_sarif, out / "raw.sarif")
+        raw_table = render(score(expected, flagged_cases(bt.findings)), "Raw Semgrep results")
+        header += [f"- Results: {len(bt.findings)} in {bt.in_scope_groups} groups", f"- Run: `{bt.run_id}`"]
+        if bt.status in ("estimated", "awaiting_confirmation"):
+            header += [f"- Triage: not run ({bt.message or 'estimate only'}); estimate ${bt.estimate_usd:.2f}", ""]
+            report = "\n".join(header) + raw_table
+        else:
+            kept = [f for f in bt.findings if f.fingerprint not in bt.dropped]
+            raw = json.loads((out / "raw.sarif").read_text(encoding="utf-8"))
+            (out / "scoring.sarif").write_text(json.dumps(scoring_sarif(raw, bt.dropped)), encoding="utf-8")
+            model = "scripted replies" if args.script else f"`{settings.model_for('triage')}`"
+            header += [
+                f"- Triage: {model}, {bt.triaged_groups} of {bt.in_scope_groups} groups answered, "
+                f"{len(bt.findings) - len(kept)} results suppressed, status {bt.status}, spent ${bt.spent_usd:.4f}",
+            ]
+            if bt.message:
+                header.append(f"- Note: {bt.message}")
+            if args.limit is not None:
+                header.append(f"- Partial: only the first {args.limit} groups were triaged; the rest count as raw")
+            header.append("")
+            after = render(score(expected, flagged_cases(kept)), "After triage")
+            report = "\n".join(header) + raw_table + "\n" + after
+    (out / "score.md").write_text(report, encoding="utf-8")
+    shutil.rmtree(work, ignore_errors=True)
+    print(report)
+    print(f"written to {out}")
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     from bop.orchestrator import Pipeline, RunOptions
 
@@ -196,6 +303,19 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-findings", type=int, help="process at most this many in-scope findings")
     run.add_argument("--estimate-only", action="store_true", help="prepare, scan and print the cost estimate")
     run.set_defaults(func=cmd_run)
+
+    bench = sub.add_parser("bench", help="measure the scanner (and later the triage) on public benchmarks")
+    bench_sub = bench.add_subparsers(dest="bench", required=True)
+    owasp = bench_sub.add_parser("owasp", help="score our Semgrep rules on a BenchmarkJava checkout")
+    owasp.add_argument("benchmark", help="path to a clone of github.com/OWASP-Benchmark/BenchmarkJava")
+    owasp.add_argument("--out", help="output directory (default: $BOP_HOME/bench/owasp-<timestamp>)")
+    owasp.add_argument("--timeout", type=int, default=1800, help="Semgrep timeout in seconds")
+    owasp.add_argument("--triage", action="store_true", help="also triage every finding and score the result")
+    owasp.add_argument("--script", help="with --triage: replay scripted model replies instead of calling models")
+    owasp.add_argument("--yes", action="store_true", help="with --triage: proceed above BOP_WARN_USD")
+    owasp.add_argument("--estimate-only", action="store_true", help="with --triage: scan and print the cost estimate")
+    owasp.add_argument("--limit", type=int, help="with --triage: triage only the first N finding groups")
+    owasp.set_defaults(func=cmd_bench_owasp)
 
     show = sub.add_parser("show", help="print a stored run")
     show.add_argument("run_id")
