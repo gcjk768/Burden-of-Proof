@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Allow unprivileged user namespaces (the sandbox runner needs them)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[scan,dev]"
+      - name: Lint
+        run: |
+          ruff check src tests
+          ruff format --check src tests
+      - name: Unit tests
+        run: pytest tests/unit -q
+      - name: Integration test (sample app, recorded model replies)
+        env:
+          BOP_TEST_M2: ${{ github.workspace }}/.m2-bop
+        run: pytest tests/integration -q

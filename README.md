@@ -5,7 +5,7 @@
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![NVIDIA Nemotron](https://img.shields.io/badge/NVIDIA-Nemotron-76B900?logo=nvidia&logoColor=white)](https://github.com/nebius/token-factory-cookbook/tree/main/models/nemotron)
 [![Nebius Token Factory](https://img.shields.io/badge/Nebius-Token%20Factory-052B42)](https://tokenfactory.nebius.com/)
-[![Status: design](https://img.shields.io/badge/status-design%20stage-F59E0B)](#status)
+[![Status: first slice](https://img.shields.io/badge/status-first%20slice%20working-F59E0B)](#status)
 
 An agent for application security and DevSecOps engineers in regulated organizations. It takes the findings from Semgrep and OWASP Dependency-Check on a Java repository, and for each one it:
 
@@ -14,10 +14,10 @@ An agent for application security and DevSecOps engineers in regulated organizat
 3. writes the smallest patch that makes that test pass without breaking the build,
 4. opens a merge request with the evidence, or records an auditable suppression for a false positive.
 
-Every model call goes to open NVIDIA Nemotron models on Nebius Token Factory, and every build and test runs in a Token Factory Sandbox with no network access.
+Every model call goes to open NVIDIA Nemotron models on Nebius Token Factory, and every build, test and scan runs in a sandbox with no network access: Linux namespaces today, Token Factory Sandboxes next.
 
 > [!NOTE]
-> **Status: design stage.** Nothing is built yet. The diagram below is the proposed architecture, and it will change as the work lands.
+> **Status: first vertical slice working.** Scan, triage, cross-file analysis, proof test, fix and report run end to end on the sample app, inside a network-less sandbox, with recorded model replies. Live Nemotron calls are implemented but not yet exercised against Token Factory. See [Status](#status).
 
 ## Architecture
 
@@ -45,20 +45,65 @@ The diagram is a draw.io file. Open [`docs/architecture.drawio.svg`](docs/archit
 | Triage comparison | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B` | Side-by-side baseline against Lightning | Off |
 
 - **Inference.** Calls go through the OpenAI Python SDK to `https://api.tokenfactory.nebius.com/v1/` with `NEBIUS_API_KEY`. Model IDs come from environment variables and are checked against the public Token Factory catalog at startup.
-- **Sandboxes.** Each run resolves Maven dependencies once into a sandbox checkpoint. Every proof test and patch attempt then runs in a disposable branch of that checkpoint, with no network interface.
+- **Sandboxes (next milestone).** Each run will resolve Maven dependencies once into a Token Factory Sandbox checkpoint, then run every proof test and patch attempt in a disposable branch of it with no network interface. Today the same steps run in local Linux namespaces with the network cut.
 - **Cost.** Every call is recorded with its model, tokens and cost. The dashboard shows spend per model and stage, and runs stop at a budget cap.
 - **Licences.** Nemotron 3 Nano and Super are released under the NVIDIA Open Model License. Nemotron 3.5 Lightning and Nemotron 3 Ultra are released under OpenMDW-1.1.
 
+## Quick start
+
+Requirements: Linux with unprivileged user namespaces (the sandbox), Python 3.12, Java 17 or newer, and Maven 3.9.
+
+```bash
+python3.12 -m venv .venv && . .venv/bin/activate
+pip install -e ".[scan,dev]"          # the agent, Semgrep and the test tools
+cp .env.example .env                  # add NEBIUS_API_KEY for live runs
+bop doctor                            # checks the sandbox, Java, Maven, Semgrep, keys and model IDs
+```
+
+Replay the full loop on the sample app with recorded model replies. This needs no API key and spends nothing:
+
+```bash
+bop run tests/fixtures/tiny-java-app --script tests/fixtures/llm/tiny-java-app.json
+```
+
+Run it live against Nemotron on Token Factory. It prints a cost estimate first and asks for `--yes` above `BOP_WARN_USD`:
+
+```bash
+bop doctor --live                     # one tiny request per model, well under $0.001
+bop run path/to/maven-project --yes
+```
+
+Each run writes `report.md`, `suppressions.yaml`, the proof tests, patches and logs under `.bop/runs/<run-id>/`.
+
+Tests:
+
+```bash
+pytest tests/unit                     # fast, no Java or network
+pytest tests/integration              # the whole loop on the sample app with real Maven and Semgrep
+```
+
 ## Status
 
-| Week | Goal |
-|---|---|
-| 1 (to 11 Oct) | Skeleton, Token Factory client with routing and cost tracking, scanner ingest, first finding through the whole loop |
-| 2 (to 18 Oct) | Sandboxes runner, deep analysis on Ultra, full loop on a deliberately vulnerable Java app, first triage benchmark numbers |
-| 3 (to 25 Oct) | Dependency upgrades with Tavily and OSV, GitLab merge requests, dashboard, final benchmark numbers |
-| 4 (to 29 Oct) | Hosted demo with sample mode, documentation, demo video |
+What works today, verified by the test suite:
 
-Setup and run instructions will be added with the first working slice.
+- **Ingest.** Our own Apache-2.0 Semgrep taint rules for SQL injection and path traversal run offline in the sandbox, and the SARIF results become stored findings with stable fingerprints.
+- **Triage, analysis, proof and fix.** On the sample app, the SQL injection is traced across three files and proven by a failing JUnit test. It is then fixed with a prepared statement after one rejected patch. The path traversal is proven and fixed. The false positive is suppressed with verified evidence.
+- **Safety checks.** A patch that only silences the scanner is rejected because the proof test still fails. Only dependency resolution ever has network access, and API keys never reach the sandbox.
+- **Cost controls.** Every model call is recorded with tokens and cost, and runs stop at the budget cap.
+
+Not yet done:
+
+- **No live run yet.** No call has reached Token Factory from the build environment, because its network policy blocks the Token Factory hosts.
+- **Later milestones.** The Token Factory Sandboxes runner, dependency upgrades with Tavily and OSV, GitLab merge requests, the dashboard and the benchmark numbers are still to come.
+
+| Week | Goal | State |
+|---|---|---|
+| 1 (to 11 Oct) | Skeleton, Token Factory client with routing and cost tracking, scanner ingest, first finding through the whole loop | Done, replay only |
+| 2 (to 18 Oct) | Sandboxes runner, deep analysis on Ultra, full loop on a deliberately vulnerable Java app, first triage benchmark numbers | Next |
+| 3 (to 25 Oct) | Dependency upgrades with Tavily and OSV, GitLab merge requests, dashboard, final benchmark numbers | |
+| 4 (to 29 Oct) | Hosted demo with sample mode, documentation, demo video | |
+
+Design choices and their reasons are in [DECISIONS.md](DECISIONS.md). Notes on Token Factory, Nemotron and Nebius are in [FEEDBACK.md](FEEDBACK.md).
 
 ## Credits
 
@@ -66,4 +111,4 @@ Brand logos are trademarks of their owners and are used only to identify the pro
 
 ## Licence
 
-Apache-2.0. The licence file will be added with the project skeleton.
+[Apache-2.0](LICENSE). The sample app under `tests/fixtures` is deliberately vulnerable; never deploy it.
