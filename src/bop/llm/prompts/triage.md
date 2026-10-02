@@ -13,7 +13,8 @@ Rules:
 - Only mark a finding likely_false_positive when the evidence is in the code you were shown. When in
   doubt, choose needs_deep_analysis. A missed vulnerability costs far more than a second look.
 - Every verdict cites evidence: the file path, start and end line, and an excerpt copied exactly from
-  those lines. Evidence is checked against the repository; invented or paraphrased excerpts are rejected.
+  those lines, without the line-number column. Evidence is checked against the repository; invented or
+  paraphrased excerpts, and text from comments, do not count.
 - confidence is your probability (0 to 1) that the verdict is correct.
 - summary is one or two sentences an auditor can read without seeing the code.
 - Answer for every finding_id you were given, exactly once.
