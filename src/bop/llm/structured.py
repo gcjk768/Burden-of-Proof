@@ -44,22 +44,35 @@ def ask_structured[T: BaseModel](
     schema = {"name": model.__name__, "schema": response_schema(model)}
     conversation = list(messages)
     problems: list[str] = []
+    # A reply that passed the hard checks and failed only the soft ones. It is still valid, so if
+    # the retry comes back worse (cut off, malformed, or no reply at all) it is returned instead.
+    fallback: tuple[T, ChatResult] | None = None
     for attempt in range(retries + 1):
-        result = client.chat(stage, conversation, schema=schema, context=context)
+        try:
+            result = client.chat(stage, conversation, schema=schema, context=context)
+        except ModelOutputError:
+            if fallback is not None:
+                return fallback
+            raise
+        hard_ok = False
         try:
             value = model.model_validate(extract_json(result.content))
             problems = check(value) if check else []
-            if not problems and soft_check and attempt < retries:
-                # Soft problems (such as evidence that does not match the code) earn one more try,
-                # but never sink an otherwise valid reply: callers record them instead.
-                problems = soft_check(value)
+            if not problems:
+                hard_ok = True
+                if soft_check and attempt < retries:
+                    # Soft problems (such as evidence that does not match the code) earn one more try,
+                    # but never sink an otherwise valid reply: callers record them instead.
+                    problems = soft_check(value)
+                    if problems:
+                        fallback = (value, result)
         except (ValueError, ValidationError) as exc:
             problems = [str(exc)[:2000]]
         if not problems:
             return value, result
         forget = getattr(client, "forget", None)
-        if forget is not None and result.request_hash:
-            forget(result.request_hash)  # do not replay a rejected reply from the cache
+        if not hard_ok and forget is not None and result.request_hash:
+            forget(result.request_hash)  # do not replay an invalid reply from the cache
         if result.finish_reason == "length":
             problems.append("The reply was cut off at the token limit; answer more briefly.")
         conversation = [
@@ -72,4 +85,6 @@ def ask_structured[T: BaseModel](
                 + "\nReply again with only the corrected JSON object.",
             },
         ]
+    if fallback is not None:
+        return fallback
     raise ModelOutputError(f"{stage}: no valid {model.__name__} after {retries + 1} tries: " + "; ".join(problems))

@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from bop.runner.base import sandbox_env
+from bop.runner.jail import privilege_state, privileges_dropped
 from bop.runner.local import LocalNamespaceRunner
 
 SECRETS = {
@@ -103,3 +104,72 @@ def test_loopback_works_without_network(tmp_path):
     )
     result = runner.run([sys.executable, "-c", probe], cwd=tmp_path, timeout_s=30, network=False)
     assert "LOOPBACK OK" in result.stdout, result.stdout + result.stderr
+
+
+def test_privilege_state_parsing():
+    status = "Name:\tx\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\n"
+    status += "CapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t1\n"
+    assert privileges_dropped(privilege_state(status))
+    assert not privileges_dropped(privilege_state(status.replace("CapBnd:\t0000000000000000", "CapBnd:\t000001ff")))
+    assert not privileges_dropped(privilege_state(status.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0")))
+    assert not privileges_dropped(privilege_state("Name:\tx\n"))
+
+
+@needs_namespaces
+def test_command_has_no_capabilities_and_only_loopback(tmp_path):
+    status = runner.run(["cat", "/proc/self/status"], cwd=tmp_path, timeout_s=30)
+    assert privileges_dropped(privilege_state(status.stdout)), status.stdout
+    interfaces = runner.run(["cat", "/proc/net/dev"], cwd=tmp_path, timeout_s=30, network=False)
+    names = [line.split(":")[0].strip() for line in interfaces.stdout.splitlines()[2:]]
+    assert names == ["lo"], interfaces.stdout
+
+
+# The classic break-out: chroot into a subdirectory, climb out with "..", chroot again.
+ESCAPE = """
+import os
+{prelude}
+os.makedirs('/tmp/esc', exist_ok=True)
+os.chroot('/tmp/esc')
+for _ in range(64):
+    os.chdir('..')
+os.chroot('.')
+print(open({secret!r}).read())
+"""
+
+
+@needs_namespaces
+@pytest.mark.parametrize(
+    "prelude",
+    [
+        "",  # directly: chroot needs a capability the command no longer has
+        "os.unshare(os.CLONE_NEWUSER)\nos.unshare(os.CLONE_NEWNS)",  # full capabilities again, in a nested namespace
+    ],
+)
+def test_chroot_escape_cannot_reach_host_files(tmp_path, prelude):
+    work = tmp_path / "work"
+    work.mkdir()
+    secret = tmp_path / "host-secret.txt"
+    secret.write_text("HOST-SECRET")
+    result = runner.run(
+        [sys.executable, "-c", ESCAPE.format(prelude=prelude, secret=str(secret))], cwd=work, timeout_s=30
+    )
+    assert "HOST-SECRET" not in result.stdout
+    assert result.exit_code != 0
+
+
+@needs_namespaces
+def test_read_only_paths_cannot_be_remounted_writable(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    probe = (
+        "import ctypes, os\n"
+        "os.unshare(os.CLONE_NEWUSER)\nos.unshare(os.CLONE_NEWNS)\n"
+        "libc = ctypes.CDLL(None, use_errno=True)\n"
+        f"print('remount', libc.mount(None, {str(shared)!r}.encode(), None, 4096 | 32 | 16384, None))\n"
+        f"open({str(shared / 'planted')!r}, 'w').write('x')\n"
+    )
+    result = runner.run([sys.executable, "-c", probe], cwd=work, timeout_s=30, readable=[shared])
+    assert "remount -1" in result.stdout, result.stdout + result.stderr
+    assert not (shared / "planted").exists()

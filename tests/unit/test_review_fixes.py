@@ -9,21 +9,23 @@ import openai
 import pytest
 
 from bop.cli import main as cli_main
-from bop.errors import ConfigError, RateLimited
-from bop.java.maven import Maven
+from bop.config import load_settings
+from bop.errors import ConfigError, ModelOutputError, RateLimited
+from bop.java.maven import Maven, detected_provider
 from bop.llm.cache import ResponseCache
 from bop.llm.client import ChatResult, TokenFactoryClient
 from bop.llm.cost import Budget
 from bop.llm.schemas import Edit, Evidence, Patch, TriageBatch
 from bop.llm.structured import ask_structured
+from bop.llm.toolcalls import ToolCall
 from bop.repo.edits import apply_patch
 from bop.repo.evidence import strip_java_comments, verify
 from bop.repo.snapshot import FileCheckpoint, snapshot
 from bop.repo.tools import RepoTools
 from bop.runner.base import RunResult
-from bop.scanners.sarif import Finding
-from bop.stages.analyze import _unfinished
-from bop.stages.context import file_block
+from bop.scanners.sarif import Finding, FindingGroup
+from bop.stages.analyze import _investigate, _unfinished
+from bop.stages.context import build_conventions, file_block
 from bop.stages.fix import rescan_verdict
 
 SRC = "src/main/java/a/A.java"
@@ -130,6 +132,46 @@ def test_evidence_inside_a_comment_is_not_verified(repo):
     assert not check.ok and "comment" in check.problem
 
 
+def test_comment_after_a_text_block_is_still_a_comment(tmp_path):
+    (tmp_path / "Q.java").write_text(
+        'class Q {\n    static final String HELP = """\n        usage \\""" quoted\n        """;'
+        " // owner = Integer.parseInt(owner); sanitized upstream\n}\n"
+    )
+    check = verify(
+        tmp_path,
+        Evidence(
+            role="sanitizer",
+            file="Q.java",
+            start_line=4,
+            end_line=4,
+            excerpt="owner = Integer.parseInt(owner); sanitized upstream",
+            why="w",
+        ),
+    )
+    assert not check.ok and "comment" in check.problem
+    stripped = strip_java_comments((tmp_path / "Q.java").read_text())
+    assert "usage" in stripped and "parseInt" not in stripped
+
+
+@pytest.mark.parametrize(
+    ("name", "text"),
+    [
+        ("app.xml", "<bean/>\n<!-- owner = Integer.parseInt(owner) -->\n"),
+        ("app.properties", "a=b\n# owner = Integer.parseInt(owner)\n"),
+        ("schema.sql", "SELECT 1;\n-- owner = Integer.parseInt(owner)\n"),
+    ],
+)
+def test_comments_in_other_file_types_are_not_evidence(tmp_path, name, text):
+    (tmp_path / name).write_text(text)
+    check = verify(
+        tmp_path,
+        Evidence(
+            role="sanitizer", file=name, start_line=2, end_line=2, excerpt="owner = Integer.parseInt(owner)", why="w"
+        ),
+    )
+    assert not check.ok and "comment" in check.problem
+
+
 def test_comment_stripper_keeps_strings_and_lines():
     text = "a = \"http://x\"; // tail\n/* one\ntwo */ b = '/';"
     stripped = strip_java_comments(text)
@@ -150,6 +192,49 @@ def test_soft_problems_get_one_retry_then_the_reply_is_accepted():
     reply = '{"verdicts": []}'
     batch, _ = ask_structured(Replies(reply, reply), "triage", [], TriageBatch, soft_check=lambda _: ["bad excerpt"])
     assert batch.verdicts == []
+
+
+class ForgettingReplies(Replies):
+    def __init__(self, *results):
+        self.results = list(results)
+        self.forgotten = []
+
+    def chat(self, stage, messages, *, schema=None, tools=None, context=None):
+        item = self.results.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def forget(self, request_hash):
+        self.forgotten.append(request_hash)
+
+
+def result(content, finish="stop", request_hash="h"):
+    return ChatResult(
+        stage="triage", role="t", model="m", content=content, finish_reason=finish, request_hash=request_hash
+    )
+
+
+@pytest.mark.parametrize(
+    "retry",
+    [
+        result('{"verdicts": [', finish="length", request_hash="h2"),  # cut off
+        result("not json", request_hash="h2"),  # malformed
+        ModelOutputError("the model returned no choices"),  # no reply at all
+    ],
+)
+def test_a_failed_retry_falls_back_to_the_reply_that_failed_only_soft_checks(retry):
+    client = ForgettingReplies(result('{"verdicts": []}', request_hash="h1"), retry)
+    batch, call = ask_structured(client, "triage", [], TriageBatch, soft_check=lambda _: ["one excerpt not found"])
+    assert batch.verdicts == [] and call.request_hash == "h1"
+    assert "h1" not in client.forgotten  # a valid reply stays cached
+
+
+def test_hard_failures_are_forgotten_and_still_raise():
+    client = ForgettingReplies(result("nope", request_hash="h1"), result("still nope", request_hash="h2"))
+    with pytest.raises(ModelOutputError):
+        ask_structured(client, "triage", [], TriageBatch)
+    assert client.forgotten == ["h1", "h2"]
 
 
 # ---------------------------------------------------------------- tools never crash the run
@@ -217,16 +302,58 @@ class FakeRunner:
 
     def run(self, argv, *, cwd, timeout_s, network=False, env=None, writable=(), readable=()):
         self.calls.append((list(argv), network, (Path(cwd) / "src/test/java/BopWarmupTest.java").exists()))
+        self.mounts = (list(writable), list(readable))
         return RunResult(list(argv), 0, "", "", 0.1, False, network, "fake")
 
 
-def test_warm_up_runs_once_online_and_cleans_up(tmp_path):
-    (tmp_path / "pom.xml").write_text("<artifactId>junit-jupiter</artifactId>")
+def test_prepare_resolves_online_without_running_project_tests_and_cleans_up(tmp_path):
+    # JUnit only arrives transitively here, so the pom text says nothing about it.
+    (tmp_path / "pom.xml").write_text("<artifactId>spring-boot-starter-test</artifactId>")
     runner = FakeRunner()
-    Maven(runner, tmp_path / "m2").warm_test_provider(tmp_path)
+    Maven(runner, tmp_path / "m2").prepare(tmp_path)
     argv, network, existed = runner.calls[0]
+    assert len(runner.calls) == 1
     assert network and existed and "-Dtest=BopWarmupTest" in argv
     assert not (tmp_path / "src").exists()
+
+
+def test_prepare_refuses_to_overwrite_a_project_file(tmp_path):
+    existing = tmp_path / "src/test/java/BopWarmupTest.java"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("class Mine {}")
+    with pytest.raises(FileExistsError):
+        Maven(FakeRunner(), tmp_path / "m2").prepare(tmp_path)
+    assert existing.read_text() == "class Mine {}"
+
+
+def test_shared_seed_is_never_writable(tmp_path):
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    runner = FakeRunner()
+    maven = Maven(runner, tmp_path / "m2" / "repo-a", seed=seed)
+    maven.prepare(tmp_path)
+    writable, readable = runner.mounts
+    assert writable == [tmp_path / "m2" / "repo-a"] and readable == [seed]
+    assert f"-Dmaven.repo.local.tail={seed}" in runner.calls[0][0]
+    maven.test(tmp_path)
+    writable, readable = runner.mounts
+    assert writable == [] and set(readable) == {seed, tmp_path / "m2" / "repo-a"}
+
+
+def test_each_target_repository_gets_its_own_maven_repository(tmp_path):
+    settings = load_settings({"BOP_HOME": str(tmp_path / "home")}, dotenv=None)
+    a, b = settings.maven_repo_for(tmp_path / "a"), settings.maven_repo_for(tmp_path / "b")
+    assert a != b and a.parent == b.parent == tmp_path / "home" / "m2"
+    assert settings.maven_repo_for(tmp_path / "a") == a
+
+
+def test_detected_provider_drives_the_junit_convention(tmp_path):
+    (tmp_path / "pom.xml").write_text("<artifactId>spring-boot-starter-test</artifactId>")
+    output = "[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider\n"
+    assert build_conventions(tmp_path, detected_provider(output))["junit"].startswith("JUnit 5")
+    output = "[INFO] Using auto detected provider org.apache.maven.surefire.junit4.provider.JUnit4Provider\n"
+    assert build_conventions(tmp_path, detected_provider(output))["junit"].startswith("JUnit 4")
+    assert detected_provider("no provider line") is None
 
 
 # ---------------------------------------------------------------- investigation guards
@@ -238,6 +365,39 @@ def test_unfinished_investigation_turns_are_caught():
     assert "cut off" in _unfinished(r(finish_reason="length"))
     assert "could not be parsed" in _unfinished(r(malformed_tool_call=True))
     assert "empty" in _unfinished(r(content="  "))
+
+
+class AlwaysTools:
+    """Calls a tool on every turn that offers tools, then cuts off the forced conclusion."""
+
+    def __init__(self, final_replies):
+        self.final_replies = list(final_replies)
+        self.final_calls = 0
+
+    def chat(self, stage, messages, *, tools=None, context=None, schema=None):
+        if tools:
+            call = ToolCall(id="c", name="list_files", arguments={"glob": "**/*.java"})
+            return ChatResult(stage=stage, role="r", model="m", content="", tool_calls=[call])
+        self.final_calls += 1
+        content, finish = self.final_replies.pop(0)
+        return ChatResult(stage=stage, role="r", model="m", content=content, finish_reason=finish)
+
+
+def investigation_ctx(repo, llm):
+    return SimpleNamespace(workdir=repo, tools=RepoTools(repo), llm=llm)
+
+
+def test_cut_off_forced_conclusion_is_retried_then_rejected(repo):
+    llm = AlwaysTools([("The input flows from id into s.execute; however the caller at", "length")] * 2)
+    with pytest.raises(ModelOutputError, match="without a usable conclusion"):
+        _investigate(investigation_ctx(repo, llm), FindingGroup("G1", "sql_injection", [f("b", 4, SRC)]), None)
+    assert llm.final_calls == 2
+
+
+def test_forced_conclusion_retry_can_recover(repo):
+    llm = AlwaysTools([("cut", "length"), ("The query is built from a constant; not reachable.", "stop")])
+    notes, _ = _investigate(investigation_ctx(repo, llm), FindingGroup("G1", "sql_injection", [f("b", 4, SRC)]), None)
+    assert notes.startswith("The query is built from a constant")
 
 
 # ---------------------------------------------------------------- client: caching, rate limits, sticky fallback

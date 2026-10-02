@@ -20,13 +20,44 @@ the first namespace runner cut the network but left the whole host filesystem re
 project's `.env`. Commands now also get a mount namespace in which `bop.runner.jail` builds a fresh
 root: system directories and the toolchain read-only, the snapshot and declared outputs read-write,
 and empty tmpfs mounts for `/tmp` and `$HOME`. The runner refuses to start unless a probe confirms that
-a host file outside the snapshot is invisible. The shared Maven repository is writable only during
-the online prepare step and read-only for every offline build of untrusted code.
+a host file outside the snapshot is invisible.
 
-**Network only for dependency resolution.** The `prepare` step resolves every Maven dependency and
-plugin with network on and records the baseline test results. Every later build runs Maven offline
-(`-o`) with no network. Only an allowlist of environment variables reaches the sandbox, so no API key
-or token is ever visible to code under test. Proxy variables are passed only when the network is on.
+**The jail uses `pivot_root` and drops every capability.** (verification, 2 Oct 2026) The verification
+pass broke the first jail. It used `chroot`, and the command ran as root of its user namespace with
+`CAP_SYS_CHROOT`, so a test that chrooted twice climbed back to the host root and could read and write
+host files. The jail now moves the namespace onto the new root with `pivot_root` and detaches the old
+one, so the host tree is no longer mounted anywhere the command can reach. Before `exec` it empties the
+bounding, ambient, effective, permitted and inheritable capability sets. It sets and locks the
+securebits that would hand root its capabilities back. It sets `no_new_privs` and closes stray file
+descriptors. It confirms all of this through `/proc/self/status` and refuses to run the command if
+anything differs. IPC and UTS namespaces are new too. Tests cover the double-chroot escape, the same
+escape from a nested user namespace with full capabilities, and remounting a read-only path as
+writable. Bubblewrap would do the same job. We kept our own short jail so the sandbox has no extra
+system dependency and every step is tested here.
+
+**Network only for dependency resolution, and the project's tests never run online.** (verification,
+2 Oct 2026) The `prepare` step compiles main and test code with network on, but runs only a throwaway
+empty test class. Selecting it makes Surefire download the provider that matches the project's test
+classpath, whatever the pom says. JUnit often arrives transitively through spring-boot-starter-test or a
+parent pom, and the previous text check missed that. The project's own tests first run in the offline
+baseline. Every later build runs Maven offline (`-o`) with no network. Only an allowlist of environment
+variables reaches the sandbox, so no API key or token is ever visible to code under test. Proxy
+variables are passed only when the network is on. One limit remains: build plugins that the project's
+pom binds to the `test` lifecycle still run during the online step, in the host network namespace. The
+hosted demo therefore runs only the curated sample repositories. A proxy that allows only Maven
+repository hosts is the planned fix.
+
+**Each target repository gets its own Maven repository.** (verification, 2 Oct 2026) The first design
+shared one writable repository across runs, and the verification pass showed that a test running
+during the online step could plant a file next to a JUnit jar that every later build of every
+repository would load. Each target now resolves into `$BOP_HOME/m2/<name>-<hash of its path>`, which
+is writable only during its own online step. A shared cache (`BOP_MAVEN_REPO`) is optional. When set,
+it is mounted read-only and given to Maven 3.9 as the chained "tail" repository
+(`maven.repo.local.tail`), so builds read from it and never write to it. The integration tests seed
+their shared cache by building our own fixture directly, outside the sandbox.
+
+**Surefire's detected provider decides the JUnit flavour.** The proof prompt now names JUnit 4 or 5 from
+the provider Surefire reports ("Using auto detected provider ..."), with the pom text only as a fallback.
 
 **SQLite through the standard library, not SQLAlchemy.** Fourteen small tables and simple queries do
 not need an ORM, and one fewer dependency is one fewer thing to break during a hackathon.
@@ -36,11 +67,10 @@ not need an ORM, and one fewer dependency is one fewer thing to break during a h
 **IDs are scoped to the run.** Finding and group IDs come from the code, so they now carry a token
 derived from the run ID. Without it, scanning the same repository twice collided on primary keys.
 
-**The baseline is recorded offline.** Dependencies are resolved online, then the suite runs again in
-the same offline sandbox that later judges patches. Tests that pass only with network access drop
-out of the baseline instead of turning into false regressions. Loopback works inside the sandbox.
-Projects with no tests get a throwaway test during prepare, so the JUnit provider is cached for
-offline proof runs.
+**The baseline is recorded offline.** Dependencies are resolved online, then the suite runs for the
+first time in the same offline sandbox that later judges patches. Tests that need network access fail
+there and are left out of the baseline instead of turning into false regressions. Loopback works inside
+the sandbox.
 
 **Prepare runs the real lifecycle, not `dependency:go-offline`.** `go-offline` fails on projects with
 artifacts outside Maven Central (hdiv/insecure-bank has one) and still misses plugins resolved during
@@ -49,7 +79,10 @@ the real build.
 **One finding's failure stays with that finding.** Tool errors go back to the model as text. A failed
 investigation marks its finding undetermined. Any unexpected exception marks the run failed, with a
 traceback in `error.log`. Triage decisions are applied before any deep work, so a budget stop cannot
-lose them, and the finding in flight is marked `stopped`.
+lose them, and the finding in flight is marked `stopped`. A stop during triage itself keeps the
+batches that finished and marks the rest `stopped`. The forced conclusion after the last tool turn is
+checked for truncation like any other turn, gets one retry, and otherwise leaves the finding
+undetermined instead of passing half a sentence to the verdict step.
 
 **Every stage commits to SQLite before the next starts.** The run ledger (`llm_calls`, `runner_jobs`)
 records every model call and sandbox job, so the dashboard and the cost panel are queries, not logs.
@@ -122,9 +155,12 @@ A patch is applied all or nothing and rolled back byte for byte after each attem
 marker, and avoid processes, sockets, URLs, `System.exit`, reflection tricks and sleeps.
 
 **Evidence is checked against the checkout.** Every cited excerpt must appear in code (not comments) at
-the cited lines, allowing three lines of slack and ignoring a copied line-number column. Unverifiable
-evidence earns one retry. If it still fails, the verdict is kept but recorded as unverified, which
-blocks any suppression. One bad excerpt no longer discards a whole triage batch.
+the cited lines, allowing three lines of slack and ignoring a copied line-number column. Comments are
+recognised in Java (text blocks included), Kotlin, Groovy and JavaScript, in XML-like files, in SQL, and
+in properties, YAML and shell files. Unverifiable evidence earns one retry. If it still fails, the
+verdict is kept but recorded as unverified, which blocks any suppression. One bad excerpt never discards
+a whole triage batch: if the retry comes back cut off, malformed or not at all, the first reply is
+used. That reply passed every hard check and failed only the evidence check, so it stays cached.
 
 **Suppression thresholds.** Triage may suppress a finding only as `likely_false_positive` with
 confidence of at least 0.8 and verified evidence. Deep analysis may suppress only as `unreachable`

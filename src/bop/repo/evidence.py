@@ -18,7 +18,7 @@ def _norm(text: str) -> str:
 
 
 def strip_java_comments(text: str) -> str:
-    """Blank out // and /* */ comments, keeping string and char literals and every newline."""
+    """Blank out // and /* */ comments, keeping string, text-block and char literals and every newline."""
     out: list[str] = []
     i, n = 0, len(text)
     while i < n:
@@ -33,6 +33,14 @@ def strip_java_comments(text: str) -> str:
             end = n if end == -1 else end + 2
             out.extend("\n" if c == "\n" else " " for c in text[i:end])
             i = end
+        elif text.startswith('"""', i):
+            # A text block runs to the next unescaped """, across lines.
+            j = i + 3
+            while j < n and not text.startswith('"""', j):
+                j += 2 if text[j] == "\\" else 1
+            end = min(j + 3, n)
+            out.append(text[i:end])
+            i = end
         elif ch in "\"'":
             quote, start = ch, i
             i += 1
@@ -44,6 +52,32 @@ def strip_java_comments(text: str) -> str:
             out.append(ch)
             i += 1
     return "".join(out)
+
+
+_BLOCK_COMMENTS = {
+    "xml": re.compile(r"<!--.*?-->", re.S),
+    "sql": re.compile(r"/\*.*?\*/|--[^\n]*", re.S),
+    "hash": re.compile(r"(?m)^\s*[#!][^\n]*|(?<=\s)#[^\n]*"),
+}
+_COMMENT_STYLE = {
+    **dict.fromkeys((".java", ".kt", ".kts", ".groovy", ".gradle", ".scala", ".js", ".ts"), "java"),
+    **dict.fromkeys((".xml", ".html", ".jsp", ".xhtml", ".vm", ".ftl"), "xml"),
+    ".sql": "sql",
+    **dict.fromkeys((".properties", ".yaml", ".yml", ".sh", ".conf", ".cfg", ".toml", ".ini"), "hash"),
+}
+
+
+def strip_comments(text: str, suffix: str) -> str:
+    """Comments blanked out (newlines kept) for the file types evidence usually comes from.
+
+    Unknown types are returned unchanged.
+    """
+    style = _COMMENT_STYLE.get(suffix.lower())
+    if style == "java":
+        return strip_java_comments(text)
+    if style in _BLOCK_COMMENTS:
+        return _BLOCK_COMMENTS[style].sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+    return text
 
 
 @dataclass
@@ -63,7 +97,7 @@ def verify(root: Path, ev: Evidence) -> EvidenceCheck:
         return EvidenceCheck(False, f"{ev.file} does not exist")
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
-    code_lines = strip_java_comments(text).splitlines() if path.suffix == ".java" else lines
+    code_lines = strip_comments(text, path.suffix).splitlines()
     if ev.start_line > len(lines):
         return EvidenceCheck(False, f"{ev.file} has {len(lines)} lines; evidence starts at {ev.start_line}")
     excerpt = _norm(_GUTTER.sub("", ev.excerpt))

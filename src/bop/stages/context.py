@@ -38,6 +38,7 @@ class RunContext:
     marker: str = PROOF_MARKER
     initial_base_counts: Counter[str] = field(default_factory=Counter)
     current_group: str | None = None
+    test_provider: str | None = None
 
     @property
     def tools(self) -> RepoTools:
@@ -83,11 +84,15 @@ def file_block(root: Path, rel: str, limit: int = 30_000) -> str:
     return f"--- {rel}\n{text[:limit]}\n"
 
 
-def build_conventions(root: Path) -> dict[str, Any]:
+def build_conventions(root: Path, provider: str | None = None) -> dict[str, Any]:
+    """What the proof test must look like. Surefire's detected provider is the most reliable signal,
+    because JUnit often arrives transitively (spring-boot-starter-test) or from a parent pom. The pom
+    text is only a fallback."""
     pom = (root / "pom.xml").read_text(encoding="utf-8", errors="replace") if (root / "pom.xml").is_file() else ""
-    if "junit-jupiter" in pom:
+    provider = provider or ""
+    if "junitplatform" in provider or (not provider and "junit-jupiter" in pom):
         junit = "JUnit 5 (org.junit.jupiter.api)"
-    elif "<artifactId>junit</artifactId>" in pom:
+    elif "junit4" in provider or "junit47" in provider or (not provider and "<artifactId>junit</artifactId>" in pom):
         junit = "JUnit 4 (org.junit)"
     else:
         junit = "unknown; use JUnit 5 if it is on the classpath"

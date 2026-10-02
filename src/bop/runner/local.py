@@ -23,6 +23,7 @@ from pathlib import Path
 
 from bop.errors import SandboxError
 from bop.runner.base import RunResult, sandbox_env
+from bop.runner.jail import privilege_state, privileges_dropped
 
 MAX_OUTPUT_CHARS = 400_000
 JAIL_FAILURE = 125
@@ -79,7 +80,17 @@ class LocalNamespaceRunner:
         self.unshare = unshare or shutil.which("unshare") or "unshare"
 
     def _command(self, spec: dict, network: bool) -> list[str]:
-        cmd = [self.unshare, "--user", "--map-root-user", "--pid", "--fork", "--kill-child", "--mount"]
+        cmd = [
+            self.unshare,
+            "--user",
+            "--map-root-user",
+            "--pid",
+            "--fork",
+            "--kill-child",
+            "--mount",
+            "--ipc",
+            "--uts",
+        ]
         if not network:
             cmd.append("--net")
         return [*cmd, sys.executable, "-m", "bop.runner.jail", json.dumps(spec)]
@@ -120,10 +131,12 @@ class LocalNamespaceRunner:
                 return False, f"cannot build the sandbox filesystem: {probe.stderr.strip()[-300:]}"
             if probe.exit_code == 0:
                 return False, "the sandbox can read host files outside the snapshot"
-            ok = self.run(["true"], cwd=work, timeout_s=30)
-            if not ok.ok:
-                return False, f"unprivileged namespaces are not usable here: {ok.stderr.strip()[-300:]}"
-        return True, "user, PID, mount and network namespaces with a private filesystem view"
+            status = self.run(["cat", "/proc/self/status"], cwd=work, timeout_s=30)
+            if not status.ok:
+                return False, f"unprivileged namespaces are not usable here: {status.stderr.strip()[-300:]}"
+            if not privileges_dropped(privilege_state(status.stdout)):
+                return False, "commands in the sandbox keep capabilities"
+        return True, "user, PID, mount, IPC and network namespaces, a private root and no capabilities"
 
     def run(
         self,

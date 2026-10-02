@@ -1,7 +1,9 @@
 """The whole loop on the sample app, with recorded model replies and the real sandbox, Maven and Semgrep.
 
-Needs Java 17+, Maven, Semgrep and Linux user namespaces. The first run downloads the sample
-app's dependencies into a shared Maven repository (~/.cache/bop-test-m2 by default).
+Needs Java 17+, Maven, Semgrep and Linux user namespaces. The first run seeds a shared Maven cache
+(~/.cache/bop-test-m2, or BOP_TEST_M2) by building the sample app directly. That is our own
+trusted fixture, so it may write the cache. Runs then use the cache read-only, the way a real
+deployment uses BOP_MAVEN_REPO.
 """
 
 from __future__ import annotations
@@ -9,6 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -35,14 +38,25 @@ def _missing() -> str | None:
     return None
 
 
+def seeded_maven_cache(tmp_path_factory) -> Path:
+    m2 = Path(os.environ.get("BOP_TEST_M2", str(Path.home() / ".cache" / "bop-test-m2")))
+    if not (m2 / "org" / "junit").is_dir():
+        copy = tmp_path_factory.mktemp("seed") / "app"
+        shutil.copytree(APP, copy)
+        subprocess.run(
+            ["mvn", "-B", "-ntp", "-q", f"-Dmaven.repo.local={m2}", "test"], cwd=copy, check=True, timeout=1200
+        )
+    return m2
+
+
 @pytest.fixture(scope="module")
 def finished_run(tmp_path_factory):
     reason = _missing()
     if reason:
         pytest.skip(reason)
     home = tmp_path_factory.mktemp("bop-home")
-    m2 = os.environ.get("BOP_TEST_M2", str(Path.home() / ".cache" / "bop-test-m2"))
-    settings = load_settings({"BOP_HOME": str(home), "BOP_MAVEN_REPO": m2})
+    m2 = seeded_maven_cache(tmp_path_factory)
+    settings = load_settings({"BOP_HOME": str(home), "BOP_MAVEN_REPO": str(m2)})
     logs: list[str] = []
     summary = Pipeline(settings, log=logs.append).run(RunOptions(repo=APP, script=SCRIPT))
     db = sqlite3.connect(settings.db_path)
@@ -165,3 +179,41 @@ def test_budget_stop_keeps_triage_decisions_and_marks_the_finding_in_flight(fini
     assert run.states.get("suppressed") == 1  # decided at triage, applied before the deep work
     assert run.states.get("stopped") == 1
     assert run.report and "budget cap reached" in run.report.read_text()
+
+
+class BudgetAtLastTriageBatch:
+    """Triage one finding per batch, and run out of budget at the batch after the false positive."""
+
+    def __init__(self):
+        from bop.llm.fake import ScriptedClient
+
+        self.inner = ScriptedClient.from_file(SCRIPT)
+        self.saw_false_positive = False
+
+    def chat(self, stage, messages, **kwargs):
+        from bop.errors import BudgetExceeded
+
+        if stage == "triage":
+            keys = [f["key"] for f in (kwargs.get("context") or {}).get("findings", [])]
+            if self.saw_false_positive:
+                raise BudgetExceeded("test cap reached")
+            self.saw_false_positive = any("AccountRepository.java:47" in k for k in keys)
+        return self.inner.chat(stage, messages, **kwargs)
+
+
+def test_budget_stop_during_triage_keeps_the_batches_already_decided(finished_run, monkeypatch):
+    from bop.stages import triage as triage_stage
+
+    monkeypatch.setattr(triage_stage, "BATCH_SIZE", 1)
+    _, db, _, settings = finished_run
+    llm = BudgetAtLastTriageBatch()
+    run = Pipeline(settings, log=lambda _: None, llm=llm).run(RunOptions(repo=APP, script=SCRIPT))
+    assert llm.saw_false_positive, "the false positive must be triaged before the stop for this test to mean anything"
+    assert run.status == "budget_stopped"
+    assert run.states.get("suppressed") == 1  # decided in an earlier batch, applied despite the stop
+    assert run.states.get("stopped") == 1  # the batch that hit the cap
+    suppressions = db.execute(
+        "SELECT COUNT(*) FROM suppressions s JOIN finding_groups g ON g.id = s.group_id WHERE g.run_id = ?",
+        (run.run_id,),
+    ).fetchone()[0]
+    assert suppressions == 1

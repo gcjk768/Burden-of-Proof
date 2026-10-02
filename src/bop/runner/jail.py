@@ -11,6 +11,17 @@ Maven repository, the scan output). Everything else, including the user's home d
 project's ``.env``, the run database and other runs, is simply absent. ``/tmp`` and ``$HOME`` are
 empty tmpfs mounts. With the network namespace, only the loopback interface exists and it is
 brought up so tests that talk to localhost still work.
+
+Two steps make the view hold against code that tries to leave it:
+
+- ``pivot_root`` moves the namespace onto the new root and the old root is detached, so the host
+  tree is no longer mounted anywhere in this mount namespace. A ``chroot`` alone leaves it mounted,
+  and a process with ``CAP_SYS_CHROOT`` can climb back out.
+- Before ``exec`` every capability is dropped (bounding, ambient, effective, permitted and
+  inheritable sets), the securebits that would give root its capabilities back on ``exec`` are set
+  and locked, and ``no_new_privs`` is set. The command runs as uid 0 of the namespace but cannot
+  remount, unmount, chroot or regain privileges through setuid binaries. The state is checked
+  through ``/proc/self/status`` before ``exec``, and the jail refuses to run anything if it differs.
 """
 
 from __future__ import annotations
@@ -19,6 +30,7 @@ import ctypes
 import fcntl
 import json
 import os
+import platform
 import socket
 import struct
 import sys
@@ -32,8 +44,38 @@ MS_REMOUNT = 32
 MS_BIND = 4096
 MS_REC = 16384
 MS_PRIVATE = 1 << 18
+MNT_DETACH = 2
+
+PR_CAPBSET_DROP = 24
+PR_SET_SECUREBITS = 28
+PR_SET_NO_NEW_PRIVS = 38
+PR_CAP_AMBIENT = 47
+PR_CAP_AMBIENT_CLEAR_ALL = 4
+# NOROOT, NO_SETUID_FIXUP and NO_CAP_AMBIENT_RAISE, each with its lock, plus KEEP_CAPS_LOCKED.
+SECUREBITS = 0b1110_1111
+CAPABILITY_VERSION_3 = 0x20080522
+SYS_PIVOT_ROOT = {"x86_64": 155, "aarch64": 41, "riscv64": 41}
+CAP_FIELDS = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
 
 _libc = ctypes.CDLL(None, use_errno=True)
+
+
+class _CapHeader(ctypes.Structure):
+    _fields_ = (("version", ctypes.c_uint32), ("pid", ctypes.c_int))
+
+
+class _CapData(ctypes.Structure):
+    _fields_ = (("effective", ctypes.c_uint32), ("permitted", ctypes.c_uint32), ("inheritable", ctypes.c_uint32))
+
+
+def _check(rc: int, what: str) -> None:
+    if rc != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"{what}: {os.strerror(err)}")
+
+
+def _prctl(option: int, arg: int = 0) -> None:
+    _check(_libc.prctl(option, ctypes.c_ulong(arg), ctypes.c_ulong(0), ctypes.c_ulong(0), ctypes.c_ulong(0)), "prctl")
 
 
 def _mount(source: str | None, target: str, fstype: str | None, flags: int, data: str | None = None) -> None:
@@ -83,6 +125,46 @@ def _bind(source: str, root: Path, *, writable: bool) -> None:
         _mount(None, str(target), None, MS_BIND | MS_REMOUNT | MS_RDONLY | _locked_flags(source))
 
 
+def _pivot_into(root: Path) -> None:
+    """Make ``root`` the namespace's root and detach the old one, so the host tree is unreachable."""
+    number = SYS_PIVOT_ROOT.get(platform.machine())
+    if number is None:
+        raise OSError(0, f"pivot_root: unsupported architecture {platform.machine()}")
+    os.chdir(root)
+    # pivot_root(".", ".") stacks the old root on top of the new one; detaching "." removes it.
+    _check(_libc.syscall(ctypes.c_long(number), b".", b"."), "pivot_root")
+    _check(_libc.umount2(b".", MNT_DETACH), "umount old root")
+    os.chdir("/")
+    # The root itself only holds mount points. Writable places are their own mounts.
+    _mount(None, "/", None, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV)
+
+
+def _drop_privileges(last_cap: int) -> None:
+    """Leave the command with no capabilities and no way to get them back."""
+    _prctl(PR_SET_SECUREBITS, SECUREBITS)
+    for cap in range(last_cap + 1):
+        _prctl(PR_CAPBSET_DROP, cap)
+    _prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL)
+    header = _CapHeader(CAPABILITY_VERSION_3, 0)
+    data = (_CapData * 2)()
+    _check(_libc.capset(ctypes.byref(header), data), "capset")
+    _prctl(PR_SET_NO_NEW_PRIVS, 1)
+
+
+def privilege_state(status_text: str) -> dict[str, str]:
+    """The capability sets and no_new_privs flag from a /proc/<pid>/status text."""
+    fields = {}
+    for line in status_text.splitlines():
+        key, _, value = line.partition(":")
+        if key in (*CAP_FIELDS, "NoNewPrivs"):
+            fields[key] = value.strip()
+    return fields
+
+
+def privileges_dropped(state: dict[str, str]) -> bool:
+    return all(key in state and int(state[key], 16) == 0 for key in CAP_FIELDS) and state.get("NoNewPrivs") == "1"
+
+
 def _loopback_up() -> None:
     siocgifflags, siocsifflags, iff_up = 0x8913, 0x8914, 0x1
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -130,7 +212,13 @@ def build_and_exec(spec: dict) -> None:
     if not spec["network"]:
         _loopback_up()
 
-    os.chroot(root)
+    last_cap = int(Path("/proc/sys/kernel/cap_last_cap").read_text())
+    _pivot_into(root)
+    _drop_privileges(last_cap)
+    state = privilege_state(Path("/proc/self/status").read_text())
+    if not privileges_dropped(state):
+        raise OSError(0, f"capabilities were not dropped: {state}")
+    os.closerange(3, 1 << 20)  # nothing opened while building the root reaches the command
     os.chdir(spec["cwd"])
     argv = spec["argv"]
     os.execvpe(argv[0], argv, spec["env"])  # noqa: S606 (replacing this process is the point)

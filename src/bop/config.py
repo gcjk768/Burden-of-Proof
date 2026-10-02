@@ -5,7 +5,9 @@ Secrets are only ever held in memory. ``Settings.redacted()`` is what gets logge
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -63,8 +65,16 @@ class Settings:
         return self.home / "cache"
 
     @property
-    def maven_repo(self) -> Path:
-        return self.maven_repo_override or self.home / "m2"
+    def maven_seed(self) -> Path | None:
+        """A shared Maven cache that builds read but never write (BOP_MAVEN_REPO)."""
+        return self.maven_repo_override
+
+    def maven_repo_for(self, source: Path) -> Path:
+        """The writable Maven repository of one target repository, reused by its later runs only."""
+        resolved = source.resolve()
+        digest = hashlib.sha256(str(resolved).encode()).hexdigest()[:12]
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", resolved.name)[:40] or "repo"
+        return self.home / "m2" / f"{name}-{digest}"
 
     @property
     def db_path(self) -> Path:

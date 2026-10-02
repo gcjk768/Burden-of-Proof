@@ -74,9 +74,15 @@ def _investigate(ctx: RunContext, group: FindingGroup, triage: TriageVerdict | N
         if text_results:
             messages.append({"role": "user", "content": "\n\n".join(text_results)})
     messages.append({"role": "user", "content": "Stop using tools now and give your conclusion."})
-    result = ctx.llm.chat("analyze", messages, context=context)
-    transcript.append({"content": result.content, "model": result.model, "call_id": result.call_id})
-    return result.content, transcript
+    for _attempt in range(2):
+        result = ctx.llm.chat("analyze", messages, context=context)
+        transcript.append({"content": result.content, "model": result.model, "call_id": result.call_id})
+        problem = "You cannot call tools now. Give your conclusion." if result.tool_calls else _unfinished(result)
+        if problem is None:
+            return result.content, transcript
+        messages.append({"role": "assistant", "content": result.content})
+        messages.append({"role": "user", "content": problem + " Keep it under 300 words."})
+    raise ModelOutputError("the investigation ended without a usable conclusion")
 
 
 def analyze(ctx: RunContext, group: FindingGroup, triage: TriageVerdict | None) -> AnalysisVerdict | None:

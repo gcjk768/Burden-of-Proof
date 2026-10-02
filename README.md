@@ -88,7 +88,7 @@ What works today, verified by the test suite:
 
 - **Ingest.** Our own Apache-2.0 Semgrep taint rules for SQL injection and path traversal run offline in the sandbox, and the SARIF results become stored findings with stable fingerprints.
 - **Triage, analysis, proof and fix.** On the sample app, the SQL injection is traced across three files and proven by a failing JUnit test. It is then fixed with a prepared statement after one rejected patch. The path traversal is proven and fixed. The false positive is suppressed with verified evidence.
-- **Safety checks.** A patch that only silences the scanner is rejected because the proof test still fails. Every build, test and scan runs in Linux namespaces with a private filesystem view, so code under test cannot see the project's `.env`, the run database or the home directory. Only dependency resolution has network access.
+- **Safety checks.** A patch that only silences the scanner is rejected because the proof test still fails. Every build, test and scan runs in Linux namespaces with a private root and no capabilities, so code under test cannot see the project's `.env`, the run database or the home directory, and cannot climb out of the jail. Only dependency resolution has network access, and the project's own tests never run during it. Each target repository gets its own Maven repository.
 - **Cost controls.** Every model call is recorded with tokens and cost, and runs stop at the budget cap.
 
 Not yet done:

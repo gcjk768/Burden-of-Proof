@@ -46,7 +46,7 @@ def related_files(verdict: AnalysisVerdict, primary_file: str) -> list[str]:
 
 
 def prove(ctx: RunContext, group: FindingGroup, verdict: AnalysisVerdict) -> ProofResult:
-    conventions = build_conventions(ctx.workdir)
+    conventions = build_conventions(ctx.workdir, ctx.test_provider)
     sources = "".join(file_block(ctx.workdir, f) for f in related_files(verdict, group.primary.file))
     messages = [
         {"role": "system", "content": prompt("prove", marker=ctx.marker)},

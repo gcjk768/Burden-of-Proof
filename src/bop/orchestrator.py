@@ -15,7 +15,7 @@ from typing import Any
 from bop.config import Settings
 from bop.db.store import Store
 from bop.errors import BopError, BudgetExceeded
-from bop.java.maven import Maven
+from bop.java.maven import Maven, detected_provider
 from bop.llm.cache import ResponseCache
 from bop.llm.catalog import fetch_catalog
 from bop.llm.client import ChatClient, ChatResult, TokenFactoryClient
@@ -231,7 +231,7 @@ class Pipeline:
             run_dir=run_dir,
             workdir=workdir,
             runner=runner,
-            maven=Maven(runner, settings.maven_repo),
+            maven=Maven(runner, settings.maven_repo_for(options.repo), seed=settings.maven_seed),
             llm=llm,
             rules=default_rules(),
             log=self.log,
@@ -291,25 +291,20 @@ class Pipeline:
 
     def _prepare(self, ctx: RunContext) -> None:
         ctx.store.update_run(ctx.run_id, stage="prepare")
-        self.log("prepare: resolving dependencies (the only step with network access)")
+        self.log("prepare: resolving dependencies (the only step with network access; no project tests run)")
         online = ctx.maven.prepare(ctx.workdir)
-        if not online.result.ok:
-            raise BopError("the project does not build:\n" + online.result.output_tail(2000))
-        if not online.cases:
-            ctx.maven.warm_test_provider(ctx.workdir)
-        # The baseline that patches are judged against must come from the same offline sandbox.
+        if not online.ok:
+            raise BopError("the project does not build:\n" + online.output_tail(2000))
+        ctx.test_provider = detected_provider(online.stdout)
+        # The project's tests run for the first time here, offline, and become the baseline patches are judged by.
         offline = ctx.maven.test(ctx.workdir, purpose="baseline")
         if not offline.result.ok:
             raise BopError("the project does not build offline after resolution:\n" + offline.result.output_tail(2000))
+        ctx.test_provider = detected_provider(offline.result.stdout) or ctx.test_provider
         ctx.baseline = offline.cases
-        online_only = {c.key for c in online.cases if c.status == "passed"} - {
-            c.key for c in offline.cases if c.status == "passed"
-        }
-        if online_only:
-            self.log(f"prepare: {len(online_only)} tests pass only with network access; left out of the baseline")
         passed = sum(c.status == "passed" for c in offline.cases)
         ctx.store.update_run(ctx.run_id, baseline=[c.__dict__ for c in offline.cases])
-        self.log(f"prepare: offline baseline {passed}/{len(offline.cases)} tests pass")
+        self.log(f"prepare: offline baseline {passed}/{len(offline.cases)} tests pass (provider {ctx.test_provider})")
 
     def _suppress(
         self, ctx: RunContext, group: FindingGroup, verdict: TriageVerdict | AnalysisVerdict, stage: str
@@ -338,9 +333,27 @@ class Pipeline:
 
     def _loop(self, ctx: RunContext, groups: Sequence[FindingGroup]) -> None:
         ctx.store.update_run(ctx.run_id, stage="triage")
-        triaged = triage_stage.triage(ctx, groups)
+        triaged: dict[str, TriageVerdict] = {}
+        try:
+            triage_stage.triage(ctx, groups, triaged)
+        except Exception:
+            self._apply_triage(ctx, groups, triaged)  # keep the batches that finished before the stop
+            raise
+        deep = self._apply_triage(ctx, groups, triaged)
 
-        # Pass 1: apply every triage decision first, so a later budget stop cannot lose them.
+        # Pass 2: trace, prove and fix the rest, one finding at a time.
+        for group in deep:
+            ctx.current_group = group.id
+            self._deep(ctx, group, triaged.get(group.id))
+            ctx.current_group = None
+
+    def _apply_triage(
+        self, ctx: RunContext, groups: Sequence[FindingGroup], triaged: Mapping[str, TriageVerdict]
+    ) -> list[FindingGroup]:
+        """Pass 1: apply every triage decision first, so a later stop cannot lose them.
+
+        Returns the groups that need deep analysis, including those whose triage batch failed.
+        """
         deep: list[FindingGroup] = []
         for group in groups:
             verdict = triaged.get(group.id)
@@ -353,12 +366,7 @@ class Pipeline:
                 self._suppress(ctx, group, verdict, "triage")
             else:
                 deep.append(group)  # includes findings whose triage batch failed
-
-        # Pass 2: trace, prove and fix the rest, one finding at a time.
-        for group in deep:
-            ctx.current_group = group.id
-            self._deep(ctx, group, triaged.get(group.id))
-            ctx.current_group = None
+        return deep
 
     def _deep(self, ctx: RunContext, group: FindingGroup, verdict: TriageVerdict | None) -> None:
         ctx.store.update_run(ctx.run_id, stage=f"analyze {group.id}")

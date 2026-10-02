@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 
-from bop.errors import ModelOutputError
+from bop.errors import BudgetExceeded, ModelOutputError
 from bop.llm.schemas import TriageBatch, TriageVerdict, check_triage
 from bop.llm.structured import ask_structured
 from bop.repo.evidence import verify_all
@@ -32,8 +32,12 @@ def store_evidence(ctx: RunContext, verdict, checks) -> list[dict]:  # type: ign
     return rows
 
 
-def triage(ctx: RunContext, groups: Sequence[FindingGroup]) -> dict[str, TriageVerdict]:
-    verdicts: dict[str, TriageVerdict] = {}
+def triage(
+    ctx: RunContext, groups: Sequence[FindingGroup], verdicts: dict[str, TriageVerdict] | None = None
+) -> dict[str, TriageVerdict]:
+    """Triage in batches. Verdicts go into ``verdicts`` as each batch finishes, so a caller still
+    has the earlier batches' decisions when a later batch stops the run."""
+    verdicts = {} if verdicts is None else verdicts
     for start in range(0, len(groups), BATCH_SIZE):
         batch = list(groups[start : start + BATCH_SIZE])
         ids = {g.id for g in batch}
@@ -71,6 +75,10 @@ def triage(ctx: RunContext, groups: Sequence[FindingGroup]) -> dict[str, TriageV
                 ctx.store.set_group_state(g.id, "undetermined", f"triage failed: {exc}")
             ctx.log(f"triage: batch failed: {exc}")
             continue
+        except BudgetExceeded:
+            for g in groups[start:]:
+                ctx.store.set_group_state(g.id, "stopped", "budget cap reached during triage")
+            raise
         for v in result.verdicts:
             checks, problems = verify_all(ctx.workdir, v.evidence)
             ctx.store.add_verdict(
