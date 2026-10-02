@@ -36,6 +36,8 @@ import struct
 import sys
 from pathlib import Path
 
+from bop.runner.privileges import privilege_state, privileges_dropped
+
 MS_RDONLY = 1
 MS_NOSUID = 2
 MS_NODEV = 4
@@ -55,7 +57,10 @@ PR_CAP_AMBIENT_CLEAR_ALL = 4
 SECUREBITS = 0b1110_1111
 CAPABILITY_VERSION_3 = 0x20080522
 SYS_PIVOT_ROOT = {"x86_64": 155, "aarch64": 41, "riscv64": 41}
-CAP_FIELDS = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
+SYS_MOUNT_SETATTR = 442  # the same number on every architecture (Linux 5.12+)
+AT_FDCWD = -100
+AT_RECURSIVE = 0x8000
+MOUNT_ATTR_RDONLY = 0x1
 
 _libc = ctypes.CDLL(None, use_errno=True)
 
@@ -91,6 +96,51 @@ def _mount(source: str | None, target: str, fstype: str | None, flags: int, data
         raise OSError(err, f"mount {source or fstype} on {target}: {os.strerror(err)}")
 
 
+class _MountAttr(ctypes.Structure):
+    _fields_ = (
+        ("attr_set", ctypes.c_uint64),
+        ("attr_clr", ctypes.c_uint64),
+        ("propagation", ctypes.c_uint64),
+        ("userns_fd", ctypes.c_uint64),
+    )
+
+
+def _read_only_tree(target: str, source: str, *, use_setattr: bool = True) -> None:
+    """Make a bound tree read-only, including any mount nested inside it.
+
+    A plain read-only remount changes only the top mount, so a writable mount below a bound toolchain
+    path would stay writable. ``mount_setattr`` with ``AT_RECURSIVE`` covers the whole tree. Kernels
+    older than 5.12 do not have it, so each mount under the target is remounted one by one instead.
+    """
+    attr = _MountAttr(MOUNT_ATTR_RDONLY, 0, 0, 0)
+    rc = (
+        -1
+        if not use_setattr
+        else _libc.syscall(
+            ctypes.c_long(SYS_MOUNT_SETATTR),
+            ctypes.c_int(AT_FDCWD),
+            target.encode(),
+            ctypes.c_uint(AT_RECURSIVE),
+            ctypes.byref(attr),
+            ctypes.c_size_t(ctypes.sizeof(attr)),
+        )
+    )
+    if rc == 0:
+        return
+    for mount_point in [target, *_mounts_below(target)]:
+        _mount(None, mount_point, None, MS_BIND | MS_REMOUNT | MS_RDONLY | _locked_flags(mount_point))
+
+
+def _mounts_below(target: str) -> list[str]:
+    below = []
+    with open("/proc/self/mountinfo", encoding="utf-8") as handle:
+        for line in handle:
+            point = line.split()[4].replace("\\040", " ")
+            if point.startswith(target.rstrip("/") + "/"):
+                below.append(point)
+    return below
+
+
 def _locked_flags(path: str) -> int:
     """Flags a remount inside a user namespace must keep, or the kernel refuses it."""
     st = os.statvfs(path)
@@ -122,7 +172,7 @@ def _bind(source: str, root: Path, *, writable: bool) -> None:
     _ensure_mountpoint(target, os.path.isdir(source))
     _mount(source, str(target), None, MS_BIND | MS_REC)
     if not writable:
-        _mount(None, str(target), None, MS_BIND | MS_REMOUNT | MS_RDONLY | _locked_flags(source))
+        _read_only_tree(str(target), source)
 
 
 def _pivot_into(root: Path) -> None:
@@ -149,20 +199,6 @@ def _drop_privileges(last_cap: int) -> None:
     data = (_CapData * 2)()
     _check(_libc.capset(ctypes.byref(header), data), "capset")
     _prctl(PR_SET_NO_NEW_PRIVS, 1)
-
-
-def privilege_state(status_text: str) -> dict[str, str]:
-    """The capability sets and no_new_privs flag from a /proc/<pid>/status text."""
-    fields = {}
-    for line in status_text.splitlines():
-        key, _, value = line.partition(":")
-        if key in (*CAP_FIELDS, "NoNewPrivs"):
-            fields[key] = value.strip()
-    return fields
-
-
-def privileges_dropped(state: dict[str, str]) -> bool:
-    return all(key in state and int(state[key], 16) == 0 for key in CAP_FIELDS) and state.get("NoNewPrivs") == "1"
 
 
 def _loopback_up() -> None:

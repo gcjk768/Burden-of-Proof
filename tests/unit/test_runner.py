@@ -5,8 +5,8 @@ import pytest
 
 from bop.runner import local
 from bop.runner.base import sandbox_env
-from bop.runner.jail import privilege_state, privileges_dropped
 from bop.runner.local import LocalNamespaceRunner
+from bop.runner.privileges import privilege_state, privileges_dropped
 
 SECRETS = {
     "NEBIUS_API_KEY": "k",
@@ -215,3 +215,58 @@ def test_proxy_credentials_reach_the_command_but_not_its_argv(tmp_path):
         ["sh", "-c", 'echo "$HTTPS_PROXY"'], cwd=tmp_path, timeout_s=30, network=True, env={"HTTPS_PROXY": secret}
     )
     assert secret in result.stdout
+
+
+NESTED = """
+import os, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, {src!r})
+from bop.runner.local import LocalNamespaceRunner
+from bop.runner import jail
+readable, rw, work = Path({readable!r}), Path({rw!r}), Path({work!r})
+# The writable mount nested inside a path the sandbox binds read-only.
+subprocess.run(["mount", "--bind", str(rw), str(readable / "sub")], check=True)
+result = LocalNamespaceRunner().run(
+    ["sh", "-c", "echo x > " + str(readable / "sub" / "planted")], cwd=work, timeout_s=30, readable=[readable]
+)
+print("jail exit", result.exit_code, result.stderr.strip()[-200:])
+# The fallback for kernels without mount_setattr, applied to a fresh bind of the same tree.
+view = work / "view"
+view.mkdir()
+subprocess.run(["mount", "--rbind", str(readable), str(view)], check=True)
+jail._read_only_tree(str(view), str(readable), use_setattr=False)
+try:
+    (view / "sub" / "fallback").write_text("x")
+    print("fallback WROTE")
+except OSError as exc:
+    print("fallback refused", exc.errno)
+"""
+
+
+@needs_namespaces
+def test_mounts_nested_under_a_read_only_path_are_read_only_too(tmp_path):
+    import shutil
+    import subprocess
+
+    if not shutil.which("mount"):
+        pytest.skip("mount(8) is needed to build the nested mount")
+    readable, rw, work = tmp_path / "toolchain", tmp_path / "rw", tmp_path / "work"
+    for d in (readable / "sub", rw, work):
+        d.mkdir(parents=True)
+    src = str(Path(__file__).resolve().parents[2] / "src")
+    code = NESTED.format(src=src, readable=str(readable), rw=str(rw), work=str(work))
+    outer = subprocess.run(
+        ["unshare", "--user", "--map-root-user", "--mount", sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert "jail exit 0" not in outer.stdout, outer.stdout + outer.stderr
+    assert "fallback refused" in outer.stdout, outer.stdout + outer.stderr
+    assert not (rw / "planted").exists() and not (rw / "fallback").exists()
+
+
+@needs_namespaces
+def test_the_sandbox_adds_nothing_to_a_commands_output(tmp_path):
+    result = runner.run(["true"], cwd=tmp_path, timeout_s=30)
+    assert result.ok and result.stdout == "" and result.stderr == ""

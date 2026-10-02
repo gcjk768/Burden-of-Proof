@@ -23,7 +23,7 @@ from pathlib import Path
 
 from bop.errors import SandboxError
 from bop.runner.base import RunResult, sandbox_env
-from bop.runner.jail import privilege_state, privileges_dropped
+from bop.runner.privileges import privilege_state, privileges_dropped
 
 MAX_OUTPUT_CHARS = 400_000
 JAIL_FAILURE = 125

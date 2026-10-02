@@ -35,7 +35,10 @@ escape from a nested user namespace with full capabilities, and remounting a rea
 writable. Configuration files that `/etc` links elsewhere, such as `/etc/resolv.conf` pointing into
 `/run` on systemd-resolved hosts, have their real file bound read-only too, or DNS fails on GitHub's
 Ubuntu runners. The command's environment no longer travels in the jail's argument list, which any local
-user can read, because a proxy URL can carry a password. Bubblewrap would do the same job. We kept our own short jail so the sandbox has no extra
+user can read, because a proxy URL can carry a password. The third verification pass noted that a read-only remount changes only the top mount, so a writable
+mount nested under a bound toolchain path would stay writable. Read-only binds are now made read-only
+recursively with `mount_setattr`, or mount by mount on kernels older than 5.12, and a test builds such a
+nested mount to check both. Bubblewrap would do the same job. We kept our own short jail so the sandbox has no extra
 system dependency and every step is tested here.
 
 **Host-side code never follows links a build planted.** (2 Oct 2026) Builds run with the snapshot
