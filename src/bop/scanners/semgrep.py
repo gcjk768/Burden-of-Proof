@@ -69,6 +69,8 @@ def run_semgrep(
         timeout_s=timeout_s,
         network=False,
         env={"SEMGREP_ENABLE_VERSION_CHECK": "0", "SEMGREP_SEND_METRICS": "off"},
+        readable=[rules],
+        writable=[out.parent],
     )
     findings = load_sarif(out, known_rules=rule_ids(rules)) if out.is_file() else []
     return ScanResult(result, out, findings)

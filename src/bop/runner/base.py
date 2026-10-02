@@ -68,4 +68,11 @@ class Runner(Protocol):
         timeout_s: int,
         network: bool = False,
         env: Mapping[str, str] | None = None,
-    ) -> RunResult: ...
+        writable: Sequence[Path] = (),
+        readable: Sequence[Path] = (),
+    ) -> RunResult:
+        """Run ``argv`` in ``cwd``. ``cwd`` and ``writable`` may be written; ``readable`` may be read.
+
+        A real sandbox exposes nothing else of the host filesystem beyond the toolchain.
+        """
+        ...

@@ -81,8 +81,12 @@ class RecordingRunner:
         timeout_s: int,
         network: bool = False,
         env: Mapping[str, str] | None = None,
+        writable: Sequence[Path] = (),
+        readable: Sequence[Path] = (),
     ) -> RunResult:
-        result = self.inner.run(argv, cwd=cwd, timeout_s=timeout_s, network=network, env=env)
+        result = self.inner.run(
+            argv, cwd=cwd, timeout_s=timeout_s, network=network, env=env, writable=writable, readable=readable
+        )
         self.count += 1
         tool = Path(argv[0]).name
         purpose = f"{tool} {next((a for a in argv[1:] if not a.startswith('-')), '')}".strip()

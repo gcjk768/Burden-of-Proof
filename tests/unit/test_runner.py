@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -48,3 +49,57 @@ def test_secrets_do_not_reach_the_command(tmp_path, monkeypatch):
 def test_timeout_kills_the_command(tmp_path):
     result = runner.run([sys.executable, "-c", "import time; time.sleep(30)"], cwd=tmp_path, timeout_s=2)
     assert result.timed_out and not result.ok and result.duration_s < 15
+
+
+@needs_namespaces
+def test_host_files_outside_the_snapshot_are_invisible(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (tmp_path / "secret.env").write_text("NEBIUS_API_KEY=sk-should-not-leak")
+    readme = Path(__file__).resolve().parents[2] / "README.md"
+    for target in (tmp_path / "secret.env", readme):
+        result = runner.run(["cat", str(target)], cwd=work, timeout_s=30)
+        assert result.exit_code != 0 and "sk-should-not-leak" not in result.stdout, target
+
+
+@needs_namespaces
+def test_home_is_empty_and_snapshot_writable_and_system_read_only(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    script = (
+        "import os\n"
+        "print('home', os.listdir(os.environ['HOME']))\n"
+        "open('out.txt', 'w').write('ok')\n"
+        "try:\n    open('/usr/bop-probe', 'w')\n    print('usr writable')\n"
+        "except OSError:\n    print('usr read-only')\n"
+    )
+    result = runner.run([sys.executable, "-c", script], cwd=work, timeout_s=30)
+    assert "home []" in result.stdout and "usr read-only" in result.stdout, result.stdout + result.stderr
+    assert (work / "out.txt").read_text() == "ok"
+
+
+@needs_namespaces
+def test_declared_paths_are_visible(tmp_path):
+    work, extra, out = tmp_path / "work", tmp_path / "rules", tmp_path / "out"
+    for d in (work, extra, out):
+        d.mkdir()
+    (extra / "rules.yaml").write_text("rules: []")
+    result = runner.run(
+        ["sh", "-c", f"cat {extra}/rules.yaml && echo hi > {out}/x && (echo no > {extra}/y 2>/dev/null || echo ro)"],
+        cwd=work,
+        timeout_s=30,
+        readable=[extra],
+        writable=[out],
+    )
+    assert "rules: []" in result.stdout and "ro" in result.stdout, result.stdout + result.stderr
+    assert (out / "x").read_text().strip() == "hi"
+
+
+@needs_namespaces
+def test_loopback_works_without_network(tmp_path):
+    probe = (
+        "import socket\ns = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(1)\n"
+        "socket.create_connection(s.getsockname(), timeout=3); print('LOOPBACK OK')\n"
+    )
+    result = runner.run([sys.executable, "-c", probe], cwd=tmp_path, timeout_s=30, network=False)
+    assert "LOOPBACK OK" in result.stdout, result.stdout + result.stderr

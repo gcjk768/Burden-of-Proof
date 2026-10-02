@@ -49,7 +49,7 @@ class Maven:
         return [*argv, *goals]
 
     def _run(self, purpose: str, argv: list[str], workdir: Path, *, network: bool, timeout_s: int) -> RunResult:
-        result = self.runner.run(argv, cwd=workdir, timeout_s=timeout_s, network=network)
+        result = self.runner.run(argv, cwd=workdir, timeout_s=timeout_s, network=network, writable=[self.repo])
         if self.on_job:
             self.on_job(purpose, result)
         return result
