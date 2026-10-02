@@ -1,0 +1,74 @@
+# Burden of Proof Semgrep rules for Java.
+# Copyright 2026 Burden of Proof contributors. Licensed under Apache-2.0.
+#
+# Taint rules: a method parameter (or a request value) that reaches a dangerous call within
+# the same method is reported. Semgrep CE does not follow values across methods or files,
+# so these rules over-report on purpose: every match is triaged and traced across the
+# codebase by the models, then proven or dismissed with evidence.
+rules:
+  - id: bop.java.sqli.tainted-query
+    mode: taint
+    languages: [java]
+    severity: ERROR
+    message: >-
+      A value from outside this method reaches the text of a SQL statement. If it can come
+      from untrusted input, this is SQL injection.
+    metadata:
+      cwe: ["CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"]
+      owasp: ["A03:2021 - Injection"]
+      category: security
+      weakness: sql_injection
+      confidence: LOW
+    pattern-sources:
+      - patterns:
+          - pattern-inside: |
+              $RET $METHOD(..., $TYPE $PARAM, ...) { ... }
+          - pattern: $PARAM
+      - pattern: (javax.servlet.http.HttpServletRequest $R).$GET(...)
+      - pattern: (jakarta.servlet.http.HttpServletRequest $R).$GET(...)
+    pattern-sinks:
+      - patterns:
+          - pattern: $S.$EXEC($QUERY, ...)
+          - metavariable-regex:
+              metavariable: $EXEC
+              regex: ^(executeQuery|executeUpdate|executeLargeUpdate|execute|addBatch|prepareStatement|prepareCall|nativeSQL|createQuery|createNativeQuery|queryForList|queryForObject|queryForMap|update)$
+          - focus-metavariable: $QUERY
+
+  - id: bop.java.path-traversal.tainted-path
+    mode: taint
+    languages: [java]
+    severity: ERROR
+    message: >-
+      A value from outside this method is used to build a file path without checking that the
+      result stays inside the intended directory. If it can come from untrusted input, this is
+      path traversal.
+    metadata:
+      cwe: ["CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"]
+      owasp: ["A01:2021 - Broken Access Control"]
+      category: security
+      weakness: path_traversal
+      confidence: LOW
+    pattern-sources:
+      - patterns:
+          - pattern-inside: |
+              $RET $METHOD(..., $TYPE $PARAM, ...) { ... }
+          - pattern: $PARAM
+      - pattern: (javax.servlet.http.HttpServletRequest $R).$GET(...)
+      - pattern: (jakarta.servlet.http.HttpServletRequest $R).$GET(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: (java.nio.file.Path $BASE).resolve($X)
+              - pattern: java.nio.file.Paths.get($BASE, $X, ...)
+              - pattern: java.nio.file.Path.of($BASE, $X, ...)
+              - pattern: new java.io.File($BASE, $X)
+              - pattern: new java.io.File($X)
+              - pattern: new java.io.FileInputStream($X)
+          - focus-metavariable: $X
+          # The canonical safe pattern: normalise, then reject anything outside the base directory.
+          - pattern-not-inside: |
+              $T $P = $BASE.resolve($X).normalize();
+              ...
+          - pattern-not-inside: |
+              $P = $BASE.resolve($X).normalize();
+              ...
