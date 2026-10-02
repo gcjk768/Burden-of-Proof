@@ -12,6 +12,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from bop.repo.paths import has_link
 from bop.runner.base import RunResult
 
 PROOF_MARKER = "[BOP-PROOF]"
@@ -40,11 +41,13 @@ def _method_name(name: str) -> str:
     return re.sub(r"\(.*\)$", "", name or "").strip()
 
 
-def parse_reports(directory: Path) -> list[TestCase]:
+def parse_reports(directory: Path, root: Path | None = None) -> list[TestCase]:
     cases: list[TestCase] = []
-    # The reports are written by the target's build, so a report (or the directory) could be a link to
-    # a host file. This runs outside the sandbox, so links are never followed.
+    # The reports are written by the target's build, so a report, the directory or a parent such as
+    # target/ could be a link to a host path. This runs outside the sandbox, so links are never followed.
     if directory.is_symlink() or not directory.is_dir():
+        return cases
+    if root is not None and has_link(root, directory):
         return cases
     for report in sorted(directory.glob("TEST-*.xml")):
         if report.is_symlink() or not report.is_file():

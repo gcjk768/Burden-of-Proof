@@ -26,8 +26,9 @@ CWE_CATEGORY = {
     "1395": "vulnerable_dependency",
 }
 LEVEL_SEVERITY = {"error": "high", "warning": "medium", "note": "low", "none": "info"}
-# A Semgrep suppression comment at the end of the matched line ("// nosemgrep: rule", "# nosem").
-_NOSEMGREP = re.compile(r"(?://|#|--|/\*)\s*nosem(?:grep)?\b.*$", re.I | re.M)
+# A comment that mentions "nosem" anywhere, which Semgrep treats as a suppression, through to the
+# end of the line ("// nosemgrep: rule", "// reviewed: nosemgrep", "/* NOSEMGREPPED */ ...").
+_NOSEMGREP = re.compile(r"(?://|#|--|/\*)[^\n]*?nosem[^\n]*$", re.I | re.M)
 
 
 @dataclass

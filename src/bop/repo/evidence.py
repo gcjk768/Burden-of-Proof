@@ -11,14 +11,16 @@ from bop.repo.paths import PathEscape, confined
 
 SLACK_LINES = 3  # models are often a line or two off; the excerpt must still match nearby
 _GUTTER = re.compile(r"^[ \t]*\d+[ \t]{2}")  # the "  42  " line-number column the tools add
-_IDENTIFIER = re.compile(r"[A-Za-z_$][\w$]")
+_IDENTIFIER = re.compile(r"[A-Za-z_$]")  # any name or keyword at all: `a = b;` is code
 
 
 def strip_gutter(excerpt: str) -> str:
-    """Remove a copied line-number column, but only when every non-empty line has one."""
+    """Remove a copied line-number column, but only when every non-empty line has one. The first line
+    is allowed to lack it, because models often start the copy partway through a line."""
     lines = excerpt.splitlines()
     filled = [line for line in lines if line.strip()]
-    if filled and all(_GUTTER.match(line) for line in filled):
+    rest = filled[1:] if len(filled) > 1 else filled
+    if rest and all(_GUTTER.match(line) for line in rest):
         return "\n".join(_GUTTER.sub("", line, count=1) for line in lines)
     return excerpt
 
@@ -70,7 +72,9 @@ _BLOCK_COMMENTS = {
     "hash": re.compile(r"(?m)^\s*[#!][^\n]*|(?<=\s)#[^\n]*"),
 }
 _COMMENT_STYLE = {
-    **dict.fromkeys((".java", ".kt", ".kts", ".groovy", ".gradle", ".scala", ".js", ".ts"), "java"),
+    # JavaScript, TypeScript and Groovy are left out: their template, regex and slashy-string literals
+    # can contain "/*", which this stripper would read as the start of a comment.
+    **dict.fromkeys((".java", ".kt", ".kts", ".scala"), "java"),
     **dict.fromkeys((".xml", ".html", ".jsp", ".xhtml", ".vm", ".ftl"), "xml"),
     ".sql": "sql",
     **dict.fromkeys((".properties", ".yaml", ".yml", ".sh", ".conf", ".cfg", ".toml", ".ini"), "hash"),
@@ -126,6 +130,7 @@ def verify(root: Path, ev: Evidence) -> EvidenceCheck:
     first = max(1, ev.start_line - SLACK_LINES)
     last = min(len(lines), ev.start_line + SLACK_LINES)
     in_comment = False
+    found_raw = False
     for start in [ev.start_line, *range(first, last + 1)]:
         end = min(len(lines), start + span)
         if excerpt in _norm("\n".join(lines[start - 1 : end])):
@@ -134,7 +139,10 @@ def verify(root: Path, ev: Evidence) -> EvidenceCheck:
                 return EvidenceCheck(True, None, start, end, raw_excerpt)
             if code and code in code_window:
                 return EvidenceCheck(True, None, start, end, code_text)
-            in_comment = True
+            found_raw = True
+            in_comment = bool(code)
+    if found_raw and not in_comment:
+        return EvidenceCheck(False, f"excerpt at {ev.file}:{ev.start_line} has no code once comments are removed")
     if in_comment:
         # Repository text can say anything; only code counts as evidence.
         return EvidenceCheck(False, f"excerpt at {ev.file}:{ev.start_line} is inside a comment, not code")

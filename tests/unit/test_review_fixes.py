@@ -656,3 +656,231 @@ def test_report_parsing_skips_links(tmp_path, tmp_path_factory):
     linked_dir = tmp_path / "linked-reports"
     linked_dir.symlink_to(host)
     assert parse_reports(linked_dir) == []
+
+
+# ---------------------------------------------------------------- third verification pass
+def test_proof_cleanup_does_not_delete_through_a_planted_parent_link(repo, tmp_path_factory):
+    from bop.repo.snapshot import remove_file_and_empty_parents
+
+    host = tmp_path_factory.mktemp("host")
+    (host / "ProofTest.java").write_text("HOST")
+    package = repo / "src/test/java/pkg"
+    package.mkdir(parents=True)
+    proof = (package / "ProofTest.java").resolve()
+    proof.write_text("proof")
+    for child in package.iterdir():
+        child.unlink()
+    package.rmdir()
+    package.symlink_to(host)  # what the build did
+    remove_file_and_empty_parents(proof, repo)
+    assert (host / "ProofTest.java").read_text() == "HOST"
+    assert not package.exists() and not package.is_symlink()
+
+
+class PlantingRunner(FakeRunner):
+    """A build that replaces paths in the snapshot with links to a host directory."""
+
+    def __init__(self, plant):
+        super().__init__()
+        self.plant = plant
+
+    def run(self, argv, *, cwd, timeout_s, network=False, env=None, writable=(), readable=()):
+        result = super().run(
+            argv, cwd=cwd, timeout_s=timeout_s, network=network, env=env, writable=writable, readable=readable
+        )
+        self.plant(Path(cwd))
+        return result
+
+
+def test_prepare_cleanup_and_report_clearing_stay_inside_the_snapshot(tmp_path, tmp_path_factory):
+    import shutil as sh
+
+    host = tmp_path_factory.mktemp("host")
+    (host / "BopWarmupTest.java").write_text("HOST")
+    (host / "surefire-reports").mkdir()
+    (host / "surefire-reports" / "TEST-host.xml").write_text("<testsuite/>")
+    (tmp_path / "pom.xml").write_text("<project/>")
+
+    def plant(work):
+        if (work / "src/test/java").is_dir() and not (work / "src/test/java").is_symlink():
+            sh.rmtree(work / "src/test/java")
+            (work / "src/test/java").symlink_to(host)
+        target = work / "target"
+        if not target.is_symlink():
+            sh.rmtree(target, ignore_errors=True)
+            target.symlink_to(host)
+
+    maven = Maven(PlantingRunner(plant), tmp_path / "m2")
+    maven.prepare(tmp_path)
+    maven.test(tmp_path)
+    maven.test(tmp_path)  # the second run clears reports through the target link planted by the first
+    assert (host / "BopWarmupTest.java").read_text() == "HOST"
+    assert (host / "surefire-reports" / "TEST-host.xml").exists()
+
+
+def test_code_window_refuses_a_planted_link(repo, tmp_path_factory):
+    from bop.stages.context import code_window
+
+    host = tmp_path_factory.mktemp("host")
+    (host / "secret.env").write_text("NEBIUS_API_KEY=sk-host-secret")
+    target = repo / SRC
+    target.unlink()
+    target.symlink_to(host / "secret.env")
+    window = code_window(repo, f("b", 1, SRC))
+    assert "sk-host-secret" not in window and "not found" in window
+
+
+def test_prepare_warms_every_module_that_runs_surefire_and_skips_source_checks(tmp_path):
+    from bop.java.maven import test_modules
+
+    ns = 'xmlns="http://maven.apache.org/POM/4.0.0"'
+    (tmp_path / "pom.xml").write_text(
+        f"<project {ns}><packaging>pom</packaging><modules><module>core</module><module>web</module></modules>"
+        "</project>"
+    )
+    for module in ("core", "web"):
+        (tmp_path / module).mkdir()
+        (tmp_path / module / "pom.xml").write_text(f"<project {ns}><artifactId>{module}</artifactId></project>")
+    assert [m.name for m in test_modules(tmp_path)] == ["core", "web"]
+
+    seen = []
+
+    class Recording(FakeRunner):
+        def run(self, argv, *, cwd, **kwargs):
+            seen.extend(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("BopWarmupTest.java"))
+            return super().run(argv, cwd=cwd, **kwargs)
+
+    runner = Recording()
+    Maven(runner, tmp_path / "m2").prepare(tmp_path)
+    assert sorted(seen) == ["core/src/test/java/BopWarmupTest.java", "web/src/test/java/BopWarmupTest.java"]
+    assert "-Drat.skip=true" in runner.calls[0][0] and "-Dlicense.skip=true" in runner.calls[0][0]
+    assert not list(tmp_path.rglob("BopWarmupTest.java"))
+
+
+@pytest.mark.parametrize(
+    "comment", ["// nosemgrep_ok", "// NOSEMGREPPED", "// nosemantic check", "// reviewed: nosemgrep", "/* nosem */"]
+)
+def test_every_form_semgrep_honours_is_refused_in_patches(repo, comment):
+    edit = Edit(file=SRC, search="int x = 1;", replace=f"int x = 1; {comment}")
+    applied = apply_patch(repo, Patch(edits=[edit], explanation="e"), FileCheckpoint(repo))
+    assert not applied.ok and "suppression" in applied.problems[0]
+
+
+def test_a_marker_already_in_the_search_does_not_let_a_new_one_in(repo):
+    (repo / SRC).write_text('package a;\nclass A {\n    @SuppressWarnings("unused")\n    int x = 1;\n}\n')
+    edit = Edit(
+        file=SRC,
+        search='@SuppressWarnings("unused")\n    int x = 1;',
+        replace='@SuppressWarnings("unused")\n    int x = 1; // nosemgrep',
+    )
+    applied = apply_patch(repo, Patch(edits=[edit], explanation="e"), FileCheckpoint(repo))
+    assert not applied.ok
+
+
+def test_a_suppression_comment_does_not_change_a_findings_identity():
+    from bop.scanners.sarif import fingerprint
+
+    plain = fingerprint("t", "r", "A.java", "stmt.executeQuery(sql);")
+    for comment in ("// reviewed: nosemgrep", "/* NOSEMGREPPED */", "// nosemgrep_ok"):
+        assert fingerprint("t", "r", "A.java", f"stmt.executeQuery(sql); {comment}") == plain
+
+
+def test_a_match_hidden_behind_a_suppression_still_counts_in_the_rescan():
+    hidden = f("other", 4)
+    hidden.in_scope, hidden.suppressed_in_source = False, True
+    _, new = rescan_verdict(Counter({"b": 1}), Counter({"b": 1}), [hidden], ["Q.java"])
+    assert new == [hidden]
+
+
+def unavailable(cls, code):
+    return error(cls, code)
+
+
+@pytest.mark.parametrize(
+    ("failure", "code"), [(openai.InternalServerError, 503), (openai.NotFoundError, 404)], ids=["503", "404"]
+)
+def test_a_read_only_replay_takes_the_recorded_fallback(settings, failure, code):
+    recording, calls = client_with(settings, [error(failure, code), reply("from super")])
+    live = recording.chat("analyze", [{"role": "user", "content": "x"}])
+    assert live.fallback_from and len(calls) == 2
+    replay, replay_calls = client_with(settings, [], cache_mode="read")
+    again = replay.chat("analyze", [{"role": "user", "content": "x"}])
+    assert again.content == "from super" and again.fallback_from == live.fallback_from and replay_calls == []
+
+
+def test_reasoning_effort_is_not_part_of_the_cache_key(settings):
+    rejected = error(openai.BadRequestError, 400)
+    rejected.message = "Unrecognized request argument supplied: reasoning_effort"
+    rejected.args = (rejected.message,)
+    recording, _ = client_with(settings, [rejected, reply("{}")])
+    recording.chat("triage", [{"role": "user", "content": "x"}])
+    replay, replay_calls = client_with(settings, [], cache_mode="read")
+    assert replay.chat("triage", [{"role": "user", "content": "x"}]).content == "{}" and replay_calls == []
+
+
+def test_an_unparseable_reply_is_recorded_and_charged(settings):
+    records = []
+    usage = SimpleNamespace(prompt_tokens=50_000, completion_tokens=16_000, completion_tokens_details=None)
+    empty = SimpleNamespace(choices=[], usage=usage)
+    client, _ = client_with(settings, [empty], cache_mode="off")
+    client.recorder = lambda result, route, context, err: records.append((result, err)) or len(records)
+    with pytest.raises(ModelOutputError):
+        client.chat("analyze", [{"role": "user", "content": "x"}])
+    assert records and "unparseable" in records[0][1] and records[0][0].cost_usd > 0
+    assert client.budget.spent_usd == pytest.approx(records[0][0].cost_usd)
+
+
+def test_a_408_falls_back_for_that_call_only(settings):
+    client, calls = client_with(settings, [error(openai.APIStatusError, 408), reply("a"), reply("b")], "off")
+    client.chat("analyze", [{"role": "user", "content": "1"}])
+    client.chat("analyze", [{"role": "user", "content": "2"}])
+    assert calls == [
+        "nvidia/Nemotron-3-Ultra-550b-a55b",
+        "nvidia/nemotron-3-super-120b-a12b",
+        "nvidia/Nemotron-3-Ultra-550b-a55b",
+    ]
+
+
+def test_a_budget_stop_on_the_evidence_retry_keeps_the_valid_first_reply():
+    from bop.errors import BudgetExceeded
+
+    client = ForgettingReplies(result('{"verdicts": []}', request_hash="h1"), BudgetExceeded("cap"))
+    batch, call = ask_structured(client, "triage", [], TriageBatch, soft_check=lambda _: ["excerpt not found"])
+    assert batch.verdicts == [] and call.request_hash == "h1"
+
+
+def test_a_crlf_file_keeps_crlf_when_a_one_line_search_gets_a_multi_line_replacement(tmp_path):
+    (tmp_path / "src/main/java/a").mkdir(parents=True)
+    path = tmp_path / SRC
+    path.write_bytes(b"package a;\r\nclass A {\r\n    int x = 1;\r\n}\r\n")
+    edit = Edit(file=SRC, search="    int x = 1;", replace="    int x = 1;\n    int y = 2;")
+    applied = apply_patch(tmp_path, Patch(edits=[edit], explanation="e"), FileCheckpoint(tmp_path))
+    assert applied.ok
+    data = path.read_bytes()
+    assert data.count(b"\r\n") == data.count(b"\n") == 5
+
+
+@pytest.mark.parametrize(
+    ("name", "text", "line", "excerpt"),
+    [
+        ("A.java", "class A {\n  void m() {\n    a = b;\n  }\n}\n", 3, "a = b;"),
+        (
+            "app.js",
+            "const glob = `src/*.js`;\nconst x = 1;\ndb.query('SELECT ' + id);\n",
+            3,
+            "db.query('SELECT ' + id);",
+        ),
+        (
+            "B.java",
+            'class B {\n  void m() {\n    String q = "x"\n        + id;\n    jdbc.query(q);\n  }\n}\n',
+            4,
+            "+ id;\n    5          jdbc.query(q);",
+        ),
+    ],
+    ids=["one-letter-names", "js-template-literal", "partial-first-line"],
+)
+def test_legitimate_evidence_is_accepted(tmp_path, name, text, line, excerpt):
+    (tmp_path / name).write_text(text)
+    end = line + excerpt.count("\n")
+    check = verify(tmp_path, Evidence(role="sink", file=name, start_line=line, end_line=end, excerpt=excerpt, why="w"))
+    assert check.ok, check.problem

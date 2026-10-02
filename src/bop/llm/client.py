@@ -264,9 +264,15 @@ class TokenFactoryClient:
         fallback_from: str | None = None,
     ) -> ChatResult:
         request = self.build_request(route, messages, schema, tools)
-        key = request_key({**request, "base_url": route.base_url})
+        key = cache_key(request, route.base_url)
 
         cached = self.cache.get(key)
+        if cached is not None and cached.get("unavailable"):
+            # A recorded failure: a replay takes the same fallback path the recorded run took.
+            self._record(None, route, context, f"replayed failure: {cached.get('error', '')}")
+            raise ModelUnavailable(
+                str(cached.get("error", "model unavailable")), permanent=bool(cached.get("permanent"))
+            )
         if cached is not None:
             result = _deserialise(dict(cached))
             result.cached, result.request_hash, result.fallback_from = True, key, fallback_from
@@ -288,10 +294,31 @@ class TokenFactoryClient:
                 return self._call(route, messages, schema, tools, context, fallback_from)
             error = self._classify(exc)
             self._record(None, route, context, f"{type(exc).__name__}: {exc}")
+            if isinstance(error, ModelUnavailable):
+                failure = {"unavailable": True, "permanent": error.permanent, "error": str(error)}
+                self.cache.put(key, request, failure)
             raise error from exc
         latency = int((time.monotonic() - started) * 1000)
 
-        result = self._parse(route, response)
+        try:
+            result = self._parse(route, response)
+        except ModelOutputError as exc:
+            # The call reached the API and may have been billed: record it and charge what it reports.
+            usage = getattr(response, "usage", None)
+            prompt = getattr(usage, "prompt_tokens", 0) or 0
+            completion = getattr(usage, "completion_tokens", 0) or 0
+            failed = ChatResult(
+                stage=route.stage,
+                role=route.role,
+                model=route.model,
+                content="",
+                usage=Usage(prompt_tokens=prompt, completion_tokens=completion),
+                latency_ms=latency,
+                cost_usd=self.prices.cost(route.model, prompt, completion),
+            )
+            self.budget.add(failed.cost_usd)
+            self._record(failed, route, context, f"unparseable response: {exc}")
+            raise
         result.latency_ms = latency
         result.request_hash = key
         result.fallback_from = fallback_from
@@ -317,8 +344,8 @@ class TokenFactoryClient:
                 return BudgetExceeded("Token Factory reports the account budget is exhausted (402)")
             if exc.status_code in (404, 409):
                 return ModelUnavailable(f"model unavailable ({exc.status_code}): {exc.message}", permanent=True)
-            if exc.status_code >= 500:
-                return ModelUnavailable(f"Token Factory server error ({exc.status_code}): {exc.message}")
+            if exc.status_code == 408 or exc.status_code >= 500:
+                return ModelUnavailable(f"Token Factory error ({exc.status_code}): {exc.message}")
             return ModelOutputError(f"Token Factory error {exc.status_code}: {exc.message}")
         if isinstance(exc, (openai.APIConnectionError, openai.APITimeoutError)):
             return ModelUnavailable(f"could not reach Token Factory: {exc}")
@@ -357,6 +384,14 @@ class TokenFactoryClient:
             malformed_tool_call=malformed,
             reasoning=reasoning,
         )
+
+
+def cache_key(request: dict[str, Any], base_url: str) -> str:
+    """The cache key of a request. ``reasoning_effort`` is left out: it only reinforces
+    ``enable_thinking=false``, and whether it is sent depends on what the server accepted earlier in
+    the run, which a replay cannot know."""
+    extra = {k: v for k, v in request.get("extra_body", {}).items() if k != "reasoning_effort"}
+    return request_key({**request, "extra_body": extra, "base_url": base_url})
 
 
 def _rejects(exc: Exception) -> bool:

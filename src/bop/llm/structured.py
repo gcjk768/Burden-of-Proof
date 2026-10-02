@@ -9,7 +9,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from bop.errors import ModelOutputError
+from bop.errors import BudgetExceeded, ModelOutputError
 from bop.llm.client import ChatClient, ChatResult, Message
 from bop.llm.schemas import response_schema
 
@@ -50,7 +50,9 @@ def ask_structured[T: BaseModel](
     for attempt in range(retries + 1):
         try:
             result = client.chat(stage, conversation, schema=schema, context=context)
-        except ModelOutputError:
+        except (ModelOutputError, BudgetExceeded):
+            # The first reply is valid and already paid for. A budget stop still stops the run at
+            # the next call, which checks the same exhausted budget.
             if fallback is not None:
                 return fallback
             raise

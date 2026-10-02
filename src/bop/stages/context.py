@@ -70,9 +70,19 @@ def prompt(name: str, **values: str) -> str:
     return text
 
 
+def _snapshot_file(root: Path, rel: str) -> Path | None:
+    """A regular file inside the snapshot, or None. Builds can leave links to host paths behind, and
+    whatever is read here goes into prompts, so the path is resolved and must stay inside."""
+    try:
+        path = confined(root, rel)
+    except PathEscape:
+        return None
+    return path if path.is_file() else None
+
+
 def code_window(root: Path, finding: Finding, before: int = 15, after: int = 15) -> str:
-    path = root / finding.file
-    if not path.is_file():
+    path = _snapshot_file(root, finding.file)
+    if path is None:
         return f"(file {finding.file} not found)"
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     start = max(1, finding.start_line - before)
@@ -95,7 +105,8 @@ def build_conventions(root: Path, provider: str | None = None) -> dict[str, Any]
     """What the proof test must look like. Surefire's detected provider is the most reliable signal,
     because JUnit often arrives transitively (spring-boot-starter-test) or from a parent pom. The pom
     text is only a fallback."""
-    pom = (root / "pom.xml").read_text(encoding="utf-8", errors="replace") if (root / "pom.xml").is_file() else ""
+    pom_path = _snapshot_file(root, "pom.xml")
+    pom = pom_path.read_text(encoding="utf-8", errors="replace") if pom_path else ""
     provider = provider or ""
     if "junitplatform" in provider or (not provider and "junit-jupiter" in pom):
         junit = "JUnit 5 (org.junit.jupiter.api)"

@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 from bop.errors import BopError, ConfigError, SandboxError
+from bop.repo.paths import defuse_links
 
 _ALWAYS = shutil.ignore_patterns(".git", ".idea", ".vscode", "node_modules", "*.class", ".bop")
 _BUILD_OUTPUT = {"target", "build"}
@@ -54,7 +55,12 @@ def check_maven_project(source: Path) -> None:
 
 
 def remove_file_and_empty_parents(path: Path, stop: Path) -> None:
-    """Delete ``path`` and any parent directories it leaves empty, up to (not including) ``stop``."""
+    """Delete ``path`` and any parent directories it leaves empty, up to (not including) ``stop``.
+
+    A build may have replaced a parent directory with a link to a host path, so links on the way are
+    removed first and the delete never leaves the snapshot.
+    """
+    defuse_links(stop, path)
     path.unlink(missing_ok=True)
     parent = path.parent
     stop = stop.resolve()

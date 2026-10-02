@@ -44,7 +44,13 @@ outside the sandbox that touches the snapshot afterwards treats it as hostile. R
 replaces a planted file link with a regular file instead of writing through it, and stops the run if a
 parent directory now leads outside the snapshot. Surefire reports that are links are skipped. Proof
 tests are written with `O_NOFOLLOW`. Reading tools and evidence checks already resolve every path and
-refuse anything outside the snapshot.
+refuse anything outside the snapshot. The third verification pass found four more places that followed
+planted links: proof-test cleanup, the warm-up cleanup, clearing Surefire reports through a linked
+`target/`, and the code window sent to the model. Every host-side delete under the snapshot now first
+removes the first link on the way down (only the link itself), report parsing refuses any link between
+the snapshot root and the report, and the code window and pom read are confined like every other read.
+No build is running while this happens, because the jail kills all of its processes when its command
+exits, so a link cannot be put back between the check and the delete.
 
 **Network only for dependency resolution, and the project's tests never run online.** (verification,
 2 Oct 2026) The `prepare` step compiles main and test code with network on, but runs only a throwaway
@@ -66,6 +72,15 @@ is writable only during its own online step. A shared cache (`BOP_MAVEN_REPO`) i
 it is mounted read-only and given to Maven 3.9 as the chained "tail" repository
 (`maven.repo.local.tail`), so builds read from it and never write to it. The integration tests seed
 their shared cache by building our own fixture directly, outside the sandbox.
+
+**The warm-up reaches every module, and source checks are skipped for it.** (verification, 2 Oct
+2026) Multi-module projects and projects with a licence-header check failed in prepare after the change
+above. The modules that run Surefire are now read from the `<modules>` lists before any build, and each
+gets the empty warm-up class. The online step skips licence-header, style and formatting checks (RAT,
+license, Checkstyle, Spotless, PMD, SpotBugs and similar), which would reject the warm-up file. Their
+plugins still resolve, and the offline baseline runs them on the project's own files. Baselines of
+multi-module projects now include every module's tests. Proof tests are still written under the root
+module, so proofs in multi-module projects are not supported yet.
 
 **Surefire's detected provider decides the JUnit flavour.** The proof prompt now names JUnit 4 or 5 from
 the provider Surefire reports ("Using auto detected provider ..."), with the pom text only as a fallback.
@@ -150,6 +165,13 @@ The standard file and JDBC sinks added after looking at Benchmark misses are lab
 data they are scored on (`docs/benchmark.md`). The scoring SARIF drops suppressed results because the
 Benchmark's own reader ignores SARIF suppressions.
 
+**Any mention of `nosem` in a patch is refused.** (verification, 2 Oct 2026) Semgrep honours `nosem`
+anywhere in a comment, so `// nosemgrep_ok`, `// NOSEMGREPPED`, `// nosemantic` and
+`// reviewed: nosemgrep` all hide a match (checked with Semgrep 1.179). The patch policy now refuses any
+`nosem`, case-insensitive. Markers are counted, so a search that already holds one cannot carry a new
+one in. Fingerprints ignore any comment that mentions `nosem`. The rescan also counts a newly suppressed
+match in an edited file, so a patch that slipped past the policy would still fail there.
+
 **Findings the team already suppressed are recorded, not re-examined.** Semgrep keeps a match on a line
 marked `nosemgrep` in its SARIF, with an in-source suppression (checked with Semgrep 1.179). Such
 findings are stored with the state `suppressed_in_source` and skipped. A `nosemgrep` comment is removed
@@ -191,7 +213,8 @@ The second rule catches a patch that removes a different identical line and leav
 **Patch policy.** The allowed-folder check runs on the resolved path, so `src/main/../test/...` is
 refused, and the proof test is rewritten from its source before it judges each patch. Edits are exact
 search-and-replace blocks that must match once. A search text is tried as written first and with the
-file's Windows line endings only if that finds nothing, so files with mixed endings can be patched. They may only touch
+file's Windows line endings only if that finds nothing, so files with mixed endings can be patched. In a
+file with only Windows line endings, the replacement gets them too. They may only touch
 `src/main/`, may not add suppression comments or annotations, and may not change more than 80 lines.
 A patch is applied all or nothing and rolled back byte for byte after each attempt.
 
@@ -208,8 +231,13 @@ code left once comments are removed is rejected. Comments are recognised in Java
 included), Kotlin, Groovy and JavaScript, in XML-like files, in SQL, and in properties, YAML and shell
 files. Unverifiable evidence earns one retry. If it still fails, the
 verdict is kept but recorded as unverified, which blocks any suppression. One bad excerpt never discards
-a whole triage batch: if the retry comes back cut off, malformed or not at all, the first reply is
-used. That reply passed every hard check and failed only the evidence check, so it stays cached.
+a whole triage batch: if the retry comes back cut off, malformed, not at all, or stops at the budget
+cap, the first reply is used. That reply passed every hard check and failed only the evidence check,
+so it stays cached. After a budget stop the run still stops at its next model call. An excerpt counts
+as code if any name or keyword is left once comments are removed, so `a = b;` is code. JavaScript,
+TypeScript and Groovy files are not stripped of comments, because their template, regex and slashy
+literals can contain `/*`. A copied line-number column is removed when every line after the first has
+one, since copies often start partway through a line.
 
 **Suppression thresholds.** Triage may suppress a finding only as `likely_false_positive` with
 confidence of at least 0.8 and verified evidence. Deep analysis may suppress only as `unreachable`
@@ -229,12 +257,17 @@ that was wrong. A retry request embeds the rejected reply, so a replay needs tha
 removed in read mode. A bad reply cannot get stuck, because callers always answer it with a different
 request (the reply plus feedback), and a replay walks the same conversation turn by turn. To draw fresh
 replies, run with `BOP_CACHE=off` or clear the cache. `bop doctor --live` never uses the cache. In
-development the cache is read-write. `BOP_CACHE=read` replays only and refuses to spend.
+development the cache is read-write. `BOP_CACHE=read` replays only and refuses to spend. Failures are
+recorded too: when a model is unavailable, a marker is cached under the request, so a replay takes the
+same fallback the recorded run took. `reasoning_effort` is left out of the cache key, because whether it
+is sent depends on what the server accepted earlier in the run. Both were found by the third
+verification pass, which also showed a reply that cannot be parsed skipped the ledger and the budget.
+It is now recorded and charged for whatever usage it reports.
 
 **Only a permanent failure moves a stage to its fallback model for the rest of the run.** A 404 (model
 not found) or 409 (model stopped) after the SDK's retries keeps the deep stage on Super for the rest of
-the run. A timeout, connection error or 5xx sends only that one call to Super, and the next call tries
-Ultra again. A persistent 429 stops the run with a clear error instead of switching models, because both
+the run. A timeout (including an HTTP 408), connection error or 5xx sends only that one call to Super,
+and the next call tries Ultra again. A persistent 429 stops the run with a clear error instead of switching models, because both
 models draw on the same account limits.
 
 ## Testing

@@ -115,7 +115,7 @@ def rescan_verdict(
     new_bases = {
         f.base_fingerprint
         for f in findings
-        if f.in_scope
+        if (f.in_scope or f.suppressed_in_source)  # a match the patch hid behind nosemgrep still counts
         and f.file in edited_files
         and f.base_fingerprint not in group_bases
         and counts[f.base_fingerprint] > initial[f.base_fingerprint]

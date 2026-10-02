@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -13,7 +14,9 @@ from bop.repo.paths import PathEscape, confined, relative
 from bop.repo.snapshot import FileCheckpoint
 
 MAX_CHANGED_LINES = 80
-SUPPRESSION_MARKERS = re.compile(r"\bnosem(?:grep)?\b|NOSONAR|@SuppressWarnings|@SuppressFBWarnings|noinspection", re.I)
+# Semgrep honours "nosem" anywhere in a comment ("// nosemgrep_ok", "// reviewed: nosemgrep",
+# "/* NOSEMGREPPED */" were all checked with Semgrep 1.179), so any occurrence counts.
+SUPPRESSION_MARKERS = re.compile(r"nosem|NOSONAR|@SuppressWarnings|@SuppressFBWarnings|noinspection", re.I)
 # Proof tests must stay unit-level: no network, no processes, no reflection tricks on the JVM.
 FORBIDDEN_IN_TESTS = re.compile(
     r"\bRuntime\s*\.\s*getRuntime|\bProcessBuilder\b|\bjava\.net\.|\bSocket\b|\bHttpClient\b|\bURL\s*\("
@@ -70,6 +73,10 @@ def apply_patch(
         current = new_contents.get(path, originals[path])
         search, replace = edit.search, edit.replace
         count = current.count(search)
+        if "\r\n" in current and "\n" not in current.replace("\r\n", ""):
+            # A file with only Windows line endings keeps them, even when a one-line search matched as
+            # written and only the replacement spans lines.
+            replace = replace.replace("\r\n", "\n").replace("\n", "\r\n")
         if count == 0 and "\r\n" in current and "\n" in search:
             # The model cannot see carriage returns. Try the search with the file's Windows line
             # endings, and keep them in the replacement. Files with mixed endings match as written.
@@ -121,7 +128,10 @@ def _check_edit(root: Path, edit: Edit, allowed_prefixes: tuple[str, ...]) -> st
         return f"{edit.file} does not exist"
     if not edit.search:
         return f"empty search text for {edit.file}"
-    if SUPPRESSION_MARKERS.search(edit.replace) and not SUPPRESSION_MARKERS.search(edit.search):
+    # Counted, so a search that already holds one marker cannot carry a new one in with it.
+    added = Counter(m.lower() for m in SUPPRESSION_MARKERS.findall(edit.replace))
+    added.subtract(m.lower() for m in SUPPRESSION_MARKERS.findall(edit.search))
+    if any(n > 0 for n in added.values()):
         return "patches may not add scanner suppression comments or annotations"
     return None
 
