@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib import resources
@@ -15,6 +16,7 @@ from bop.db.store import Store
 from bop.java.maven import Maven
 from bop.java.surefire import PROOF_MARKER, TestCase
 from bop.llm.client import ChatClient
+from bop.repo.paths import PathEscape, confined
 from bop.repo.tools import RepoTools, number_lines
 from bop.runner.base import Runner
 from bop.scanners.sarif import Finding
@@ -34,7 +36,8 @@ class RunContext:
     log: Callable[[str], None]
     baseline: list[TestCase] = field(default_factory=list)
     marker: str = PROOF_MARKER
-    initial_fingerprints: set[str] = field(default_factory=set)
+    initial_base_counts: Counter[str] = field(default_factory=Counter)
+    current_group: str | None = None
 
     @property
     def tools(self) -> RepoTools:
@@ -70,7 +73,10 @@ def code_window(root: Path, finding: Finding, before: int = 15, after: int = 15)
 
 
 def file_block(root: Path, rel: str, limit: int = 30_000) -> str:
-    path = root / rel
+    try:
+        path = confined(root, rel)  # the path may come from a model's taint_path
+    except PathEscape:
+        return ""
     if not path.is_file():
         return ""
     text = path.read_text(encoding="utf-8", errors="replace")

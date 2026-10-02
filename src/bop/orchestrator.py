@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import secrets
 import sys
+import traceback
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -22,7 +23,7 @@ from bop.llm.cost import Budget, PriceTable
 from bop.llm.fake import ScriptedClient
 from bop.llm.router import Route, Router
 from bop.llm.schemas import AnalysisVerdict, TriageVerdict
-from bop.repo.snapshot import remove_file_and_empty_parents, snapshot
+from bop.repo.snapshot import check_maven_project, remove_file_and_empty_parents, snapshot
 from bop.runner.base import Runner, RunResult
 from bop.runner.local import make_runner
 from bop.scanners.sarif import FindingGroup
@@ -185,6 +186,7 @@ class Pipeline:
         settings = self.settings
         if options.budget_usd is not None:
             settings = settings.with_overrides(budget_usd=options.budget_usd)
+        check_maven_project(options.repo.resolve())
         store = Store(settings.db_path)
         run_id = new_run_id()
         run_dir = settings.runs_dir / run_id
@@ -241,32 +243,41 @@ class Pipeline:
             in_scope = [g for g in groups if g.primary.in_scope]
             if options.max_groups is not None:
                 in_scope = in_scope[: options.max_groups]
-            if not options.script:
-                summary.estimate_usd = estimate_cost(in_scope, prices, settings)
-                self.log(
-                    f"estimate: about ${summary.estimate_usd:.2f} for {len(in_scope)} findings "
-                    f"(cap ${settings.budget_usd:.2f})"
-                )
-                if options.estimate_only or (summary.estimate_usd > settings.warn_usd and not options.yes):
-                    status = "estimated" if options.estimate_only else "awaiting_confirmation"
-                    store.update_run(run_id, status=status, stage="estimate")
-                    summary.status = status
+            summary.estimate_usd = estimate_cost(in_scope, prices, settings)
+            self.log(
+                f"estimate: about ${summary.estimate_usd:.2f} for {len(in_scope)} findings at live prices "
+                f"(cap ${settings.budget_usd:.2f})"
+            )
+            over = not options.script and summary.estimate_usd > settings.warn_usd and not options.yes
+            if options.estimate_only or over:
+                status = "estimated" if options.estimate_only else "awaiting_confirmation"
+                store.update_run(run_id, status=status, stage="estimate")
+                summary.status = status
+                if over and not options.estimate_only:
                     summary.message = (
-                        ""
-                        if options.estimate_only
-                        else f"Estimated cost ${summary.estimate_usd:.2f} is above ${settings.warn_usd:.2f}. "
+                        f"Estimated cost ${summary.estimate_usd:.2f} is above ${settings.warn_usd:.2f}. "
                         "Re-run with --yes to proceed."
                     )
-                    return summary
+                return summary
             self._loop(ctx, in_scope)
             summary.status = "done"
         except BudgetExceeded as exc:
             summary.status, summary.message = "budget_stopped", str(exc)
+            if ctx.current_group:
+                stage = (store.get_run(run_id) or {"stage": "?"})["stage"]
+                store.set_group_state(ctx.current_group, "stopped", f"budget cap reached during {stage}")
             self.log(f"stopped: {exc}")
         except BopError as exc:
             summary.status, summary.message = "failed", str(exc)
             store.update_run(run_id, error=str(exc))
             self.log(f"failed: {exc}")
+        except Exception as exc:  # never leave a run marked as running
+            trace = run_dir / "error.log"
+            trace.write_text(traceback.format_exc(), encoding="utf-8")
+            summary.status = "failed"
+            summary.message = f"internal error: {type(exc).__name__}: {exc} (traceback in {trace})"
+            store.update_run(run_id, error=summary.message)
+            self.log(f"failed: {summary.message}")
         finally:
             run = store.get_run(run_id)
             if summary.status not in {"estimated", "awaiting_confirmation"}:
@@ -280,14 +291,25 @@ class Pipeline:
 
     def _prepare(self, ctx: RunContext) -> None:
         ctx.store.update_run(ctx.run_id, stage="prepare")
-        self.log("prepare: resolving dependencies and running the baseline suite (network on for this step only)")
-        baseline = ctx.maven.prepare(ctx.workdir)
-        if not baseline.result.ok:
-            raise BopError("the project does not build:\n" + baseline.result.output_tail(2000))
-        ctx.baseline = baseline.cases
-        passed = sum(c.status == "passed" for c in baseline.cases)
-        ctx.store.update_run(ctx.run_id, baseline=[c.__dict__ for c in baseline.cases])
-        self.log(f"prepare: baseline {passed}/{len(baseline.cases)} tests pass")
+        self.log("prepare: resolving dependencies (the only step with network access)")
+        online = ctx.maven.prepare(ctx.workdir)
+        if not online.result.ok:
+            raise BopError("the project does not build:\n" + online.result.output_tail(2000))
+        if not online.cases:
+            ctx.maven.warm_test_provider(ctx.workdir)
+        # The baseline that patches are judged against must come from the same offline sandbox.
+        offline = ctx.maven.test(ctx.workdir, purpose="baseline")
+        if not offline.result.ok:
+            raise BopError("the project does not build offline after resolution:\n" + offline.result.output_tail(2000))
+        ctx.baseline = offline.cases
+        online_only = {c.key for c in online.cases if c.status == "passed"} - {
+            c.key for c in offline.cases if c.status == "passed"
+        }
+        if online_only:
+            self.log(f"prepare: {len(online_only)} tests pass only with network access; left out of the baseline")
+        passed = sum(c.status == "passed" for c in offline.cases)
+        ctx.store.update_run(ctx.run_id, baseline=[c.__dict__ for c in offline.cases])
+        self.log(f"prepare: offline baseline {passed}/{len(offline.cases)} tests pass")
 
     def _suppress(
         self, ctx: RunContext, group: FindingGroup, verdict: TriageVerdict | AnalysisVerdict, stage: str
@@ -317,47 +339,54 @@ class Pipeline:
     def _loop(self, ctx: RunContext, groups: Sequence[FindingGroup]) -> None:
         ctx.store.update_run(ctx.run_id, stage="triage")
         triaged = triage_stage.triage(ctx, groups)
+
+        # Pass 1: apply every triage decision first, so a later budget stop cannot lose them.
+        deep: list[FindingGroup] = []
         for group in groups:
             verdict = triaged.get(group.id)
-            if verdict is None:
-                continue
             if (
-                verdict.verdict == "likely_false_positive"
+                verdict is not None
+                and verdict.verdict == "likely_false_positive"
                 and verdict.confidence >= TRIAGE_SUPPRESS_CONFIDENCE
                 and self._evidence_ok(ctx, group.id, "triage")
             ):
                 self._suppress(ctx, group, verdict, "triage")
-                continue
-
-            ctx.store.update_run(ctx.run_id, stage=f"analyze {group.id}")
-            analysis = analyze_stage.analyze(ctx, group, verdict)
-            if analysis is None:
-                continue
-            if analysis.verdict == "unreachable":
-                if analysis.confidence >= ANALYSIS_SUPPRESS_CONFIDENCE and self._evidence_ok(ctx, group.id, "analysis"):
-                    self._suppress(ctx, group, analysis, "analysis")
-                else:
-                    ctx.store.set_group_state(group.id, "undetermined", "unreachable but not confident enough")
-                continue
-            if analysis.verdict == "undetermined":
-                ctx.store.set_group_state(group.id, "undetermined", analysis.summary)
-                continue
-
-            ctx.store.update_run(ctx.run_id, stage=f"prove {group.id}")
-            proof = prove_stage.prove(ctx, group, analysis)
-            if not proof.proven:
-                ctx.store.set_group_state(group.id, "not_proven", "; ".join(proof.history))
-                continue
-            ctx.store.set_group_state(group.id, "proven", proof.selector)
-
-            ctx.store.update_run(ctx.run_id, stage=f"fix {group.id}")
-            try:
-                result = fix_stage.fix(ctx, group, analysis, proof)
-            finally:
-                if proof.path is not None:
-                    # each finding starts from the clean snapshot
-                    remove_file_and_empty_parents(proof.path, ctx.workdir)
-            if result.fixed:
-                ctx.store.set_group_state(group.id, "fixed", result.summary)
             else:
-                ctx.store.set_group_state(group.id, "unfixed", result.summary)
+                deep.append(group)  # includes findings whose triage batch failed
+
+        # Pass 2: trace, prove and fix the rest, one finding at a time.
+        for group in deep:
+            ctx.current_group = group.id
+            self._deep(ctx, group, triaged.get(group.id))
+            ctx.current_group = None
+
+    def _deep(self, ctx: RunContext, group: FindingGroup, verdict: TriageVerdict | None) -> None:
+        ctx.store.update_run(ctx.run_id, stage=f"analyze {group.id}")
+        analysis = analyze_stage.analyze(ctx, group, verdict)
+        if analysis is None:
+            return
+        if analysis.verdict == "unreachable":
+            if analysis.confidence >= ANALYSIS_SUPPRESS_CONFIDENCE and self._evidence_ok(ctx, group.id, "analysis"):
+                self._suppress(ctx, group, analysis, "analysis")
+            else:
+                ctx.store.set_group_state(group.id, "undetermined", "unreachable, but not confidently enough")
+            return
+        if analysis.verdict == "undetermined":
+            ctx.store.set_group_state(group.id, "undetermined", analysis.summary)
+            return
+
+        ctx.store.update_run(ctx.run_id, stage=f"prove {group.id}")
+        proof = prove_stage.prove(ctx, group, analysis)
+        if not proof.proven:
+            ctx.store.set_group_state(group.id, "not_proven", "; ".join(proof.history))
+            return
+        ctx.store.set_group_state(group.id, "proven", proof.selector)
+
+        ctx.store.update_run(ctx.run_id, stage=f"fix {group.id}")
+        try:
+            result = fix_stage.fix(ctx, group, analysis, proof)
+        finally:
+            if proof.path is not None:
+                # each finding starts from the clean snapshot
+                remove_file_and_empty_parents(proof.path, ctx.workdir)
+        ctx.store.set_group_state(group.id, "fixed" if result.fixed else "unfixed", result.summary)

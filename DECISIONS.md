@@ -15,6 +15,14 @@ network interface. Nebius Serverless AI jobs were dropped from the plan. They ar
 minutes to provision per job, have no way to disable networking, do not report exit codes, and need
 a separately funded AI Cloud account.
 
+**Each sandboxed command sees only what it needs.** (review, 2 Oct 2026) A multi-lens review found that
+the first namespace runner cut the network but left the whole host filesystem readable, including the
+project's `.env`. Commands now also get a mount namespace in which `bop.runner.jail` builds a fresh
+root: system directories and the toolchain read-only, the snapshot and declared outputs read-write,
+and empty tmpfs mounts for `/tmp` and `$HOME`. The runner refuses to start unless a probe confirms that
+a host file outside the snapshot is invisible. The shared Maven repository is writable only during
+the online prepare step and read-only for every offline build of untrusted code.
+
 **Network only for dependency resolution.** The `prepare` step resolves every Maven dependency and
 plugin with network on and records the baseline test results. Every later build runs Maven offline
 (`-o`) with no network. Only an allowlist of environment variables reaches the sandbox, so no API key
@@ -24,6 +32,24 @@ or token is ever visible to code under test. Proxy variables are passed only whe
 not need an ORM, and one fewer dependency is one fewer thing to break during a hackathon.
 
 **argparse, not Typer.** Same reason: four subcommands do not justify a dependency.
+
+**IDs are scoped to the run.** Finding and group IDs come from the code, so they now carry a token
+derived from the run ID. Without it, scanning the same repository twice collided on primary keys.
+
+**The baseline is recorded offline.** Dependencies are resolved online, then the suite runs again in
+the same offline sandbox that later judges patches. Tests that pass only with network access drop
+out of the baseline instead of turning into false regressions. Loopback works inside the sandbox.
+Projects with no tests get a throwaway test during prepare, so the JUnit provider is cached for
+offline proof runs.
+
+**Prepare runs the real lifecycle, not `dependency:go-offline`.** `go-offline` fails on projects with
+artifacts outside Maven Central (hdiv/insecure-bank has one) and still misses plugins resolved during
+the real build.
+
+**One finding's failure stays with that finding.** Tool errors go back to the model as text. A failed
+investigation marks its finding undetermined. Any unexpected exception marks the run failed, with a
+traceback in `error.log`. Triage decisions are applied before any deep work, so a budget stop cannot
+lose them, and the finding in flight is marked `stopped`.
 
 **Every stage commits to SQLite before the next starts.** The run ledger (`llm_calls`, `runner_jobs`)
 records every model call and sandbox job, so the dashboard and the cost panel are queries, not logs.
@@ -82,16 +108,23 @@ baseline still passes, and a rescan no longer reports the finding and reports no
 in the files the patch touched. The recorded demo includes a patch that only adds `.normalize()`. That
 silences the scanner, but the proof test still fails, so the patch is rejected.
 
-**Patch policy.** Edits are exact search-and-replace blocks that must match once. They may only touch
+**Rescans count duplicates.** Identical matches are told apart only by order, so fixing the first of two
+identical lines used to shift the second into its fingerprint. A finding counts as gone when the
+number of matches with its code drops by the number of group members.
+
+**Patch policy.** The allowed-folder check runs on the resolved path, so `src/main/../test/...` is
+refused, and the proof test is rewritten from its source before it judges each patch. Edits are exact
+search-and-replace blocks that must match once. They may only touch
 `src/main/`, may not add suppression comments or annotations, and may not change more than 80 lines.
 A patch is applied all or nothing and rolled back byte for byte after each attempt.
 
 **Proof test policy.** A test must live under `src/test/java` in the package it declares, contain the
 marker, and avoid processes, sockets, URLs, `System.exit`, reflection tricks and sleeps.
 
-**Evidence is checked against the checkout.** Every cited excerpt must appear at the cited lines,
-allowing three lines of slack because models are often slightly off. Unverifiable evidence is fed
-back for one retry and recorded as unverified if it still fails.
+**Evidence is checked against the checkout.** Every cited excerpt must appear in code (not comments) at
+the cited lines, allowing three lines of slack and ignoring a copied line-number column. Unverifiable
+evidence earns one retry. If it still fails, the verdict is kept but recorded as unverified, which
+blocks any suppression. One bad excerpt no longer discards a whole triage batch.
 
 **Suppression thresholds.** Triage may suppress a finding only as `likely_false_positive` with
 confidence of at least 0.8 and verified evidence. Deep analysis may suppress only as `unreachable`
@@ -104,7 +137,9 @@ undetermined for a human.
 of the run. Above `BOP_WARN_USD` (default 2 dollars) it stops and asks for `--yes`. `BOP_BUDGET_USD`
 (default 5 dollars) is a hard cap checked before every uncached call.
 
-**Responses are cached on disk by exact request.** In development the cache is read-write. `BOP_CACHE=read`
+**Responses are cached on disk by exact request, but only usable ones.** Truncated or empty replies are
+not cached, and a reply that fails validation is removed. `bop doctor --live` never uses the cache.
+If Ultra fails, the rest of the run stays on Super. Persistent 429s stop the run with a clear error. In development the cache is read-write. `BOP_CACHE=read`
 replays only and refuses to spend.
 
 ## Testing

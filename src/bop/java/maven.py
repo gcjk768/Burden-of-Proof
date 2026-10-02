@@ -17,6 +17,17 @@ from bop.runner.base import Runner, RunResult
 
 JobHook = Callable[[str, RunResult], None]
 
+WARMUP_JUNIT5 = """public class BopWarmupTest {
+    @org.junit.jupiter.api.Test
+    void warmUp() {}
+}
+"""
+WARMUP_JUNIT4 = """public class BopWarmupTest {
+    @org.junit.Test
+    public void warmUp() {}
+}
+"""
+
 
 @dataclass
 class TestRun:
@@ -49,7 +60,12 @@ class Maven:
         return [*argv, *goals]
 
     def _run(self, purpose: str, argv: list[str], workdir: Path, *, network: bool, timeout_s: int) -> RunResult:
-        result = self.runner.run(argv, cwd=workdir, timeout_s=timeout_s, network=network, writable=[self.repo])
+        # Only the online prepare step may add to the shared repository. Offline builds of untrusted code get
+        # it read-only, so one repository cannot plant artifacts that a later run would trust.
+        if network:
+            result = self.runner.run(argv, cwd=workdir, timeout_s=timeout_s, network=True, writable=[self.repo])
+        else:
+            result = self.runner.run(argv, cwd=workdir, timeout_s=timeout_s, network=False, readable=[self.repo])
         if self.on_job:
             self.on_job(purpose, result)
         return result
@@ -75,6 +91,39 @@ class Maven:
             timeout_s=self.prepare_timeout_s,
         )
         return TestRun(result, parse_reports(self._reports_dir(workdir)))
+
+    def warm_test_provider(self, workdir: Path) -> None:
+        """Projects without tests never download Surefire's JUnit provider during ``prepare``.
+
+        Run a throwaway test once, online, so later offline proof runs can execute, then remove it.
+        """
+        pom = (workdir / "pom.xml").read_text(encoding="utf-8", errors="replace")
+        if "junit-jupiter" in pom:
+            source = WARMUP_JUNIT5
+        elif "<artifactId>junit</artifactId>" in pom:
+            source = WARMUP_JUNIT4
+        else:
+            return  # no JUnit on the test classpath; proof tests cannot compile either way
+        test = workdir / "src" / "test" / "java" / "BopWarmupTest.java"
+        created_dirs = [d for d in (test.parent, test.parent.parent, test.parent.parent.parent) if not d.exists()]
+        test.parent.mkdir(parents=True, exist_ok=True)
+        test.write_text(source, encoding="utf-8")
+        try:
+            self._run(
+                "warm-up",
+                self._argv("test", "-Dtest=BopWarmupTest", "-Dsurefire.failIfNoSpecifiedTests=false", offline=False),
+                workdir,
+                network=True,
+                timeout_s=self.prepare_timeout_s,
+            )
+        finally:
+            test.unlink(missing_ok=True)
+            for leftover in (workdir / "target" / "test-classes" / "BopWarmupTest.class",):
+                leftover.unlink(missing_ok=True)
+            shutil.rmtree(self._reports_dir(workdir), ignore_errors=True)
+            for d in created_dirs:
+                if d.exists() and not any(d.iterdir()):
+                    d.rmdir()
 
     def test(self, workdir: Path, *, selector: str | None = None, purpose: str = "test") -> TestRun:
         """Run the suite (or one test, ``Class#method``) offline with no network."""

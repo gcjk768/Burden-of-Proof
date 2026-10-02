@@ -17,6 +17,7 @@ from bop.runner.base import RunResult
 PROOF_MARKER = "[BOP-PROOF]"
 _ASSERTION_TYPES = ("AssertionFailedError", "AssertionError", "ComparisonFailure", "MultipleFailuresError")
 _COMPILE_LINE = re.compile(r"^\[ERROR\].*\.java:\[\d+,\d+\].*$", re.M)
+_OFFLINE_MISSING = re.compile(r"has not been downloaded from it before|in offline mode|Cannot access \S+ in offline")
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,10 @@ def classify_proof(
     method = _method_name(test_method)
     match = next((c for c in cases if c.classname == test_class and c.name == method), None)
     if match is None:
-        errors = compile_errors(result.output_tail(40_000))
+        output = result.output_tail(40_000)
+        if _OFFLINE_MISSING.search(output):
+            return "not_run", "a dependency or plugin is missing from the offline cache (an environment problem)"
+        errors = compile_errors(output)
         if errors or result.exit_code != 0:
             detail = "\n".join(errors) if errors else result.output_tail(3000)
             return "compile_error", detail

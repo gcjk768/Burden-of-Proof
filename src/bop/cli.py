@@ -77,11 +77,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def _live_smoke(settings) -> int:  # type: ignore[no-untyped-def]
     """One tiny JSON request per configured model, thinking off, to confirm IDs, JSON mode and cost."""
+    from bop.llm.cache import ResponseCache
     from bop.llm.client import TokenFactoryClient
     from bop.llm.router import Router
     from bop.llm.structured import extract_json
 
-    client = TokenFactoryClient(settings)
+    client = TokenFactoryClient(settings, cache=ResponseCache(settings.cache_dir, "off"))  # always a real call
     schema = {
         "name": "Ping",
         "schema": {

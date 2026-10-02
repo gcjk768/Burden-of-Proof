@@ -38,20 +38,28 @@ def ask_structured[T: BaseModel](
     *,
     context: dict[str, Any] | None = None,
     check: Callable[[T], list[str]] | None = None,
+    soft_check: Callable[[T], list[str]] | None = None,
     retries: int = 1,
 ) -> tuple[T, ChatResult]:
     schema = {"name": model.__name__, "schema": response_schema(model)}
     conversation = list(messages)
     problems: list[str] = []
-    for _attempt in range(retries + 1):
+    for attempt in range(retries + 1):
         result = client.chat(stage, conversation, schema=schema, context=context)
         try:
             value = model.model_validate(extract_json(result.content))
             problems = check(value) if check else []
+            if not problems and soft_check and attempt < retries:
+                # Soft problems (such as evidence that does not match the code) earn one more try,
+                # but never sink an otherwise valid reply: callers record them instead.
+                problems = soft_check(value)
         except (ValueError, ValidationError) as exc:
             problems = [str(exc)[:2000]]
         if not problems:
             return value, result
+        forget = getattr(client, "forget", None)
+        if forget is not None and result.request_hash:
+            forget(result.request_hash)  # do not replay a rejected reply from the cache
         if result.finish_reason == "length":
             problems.append("The reply was cut off at the token limit; answer more briefly.")
         conversation = [

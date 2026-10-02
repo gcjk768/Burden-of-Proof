@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from bop.llm.schemas import Edit, Patch, ProofTest
-from bop.repo.paths import PathEscape, confined
+from bop.repo.paths import PathEscape, confined, relative
 from bop.repo.snapshot import FileCheckpoint
 
 MAX_CHANGED_LINES = 80
@@ -49,13 +49,21 @@ def apply_patch(
             continue
         path = confined(root, edit.file)
         if path not in originals:
-            originals[path] = path.read_text(encoding="utf-8")
+            try:
+                originals[path] = path.read_bytes().decode("utf-8")
+            except UnicodeDecodeError:
+                applied.problems.append(f"{edit.file} is not UTF-8; it cannot be patched safely")
+                continue
         current = new_contents.get(path, originals[path])
-        count = current.count(edit.search)
+        search, replace = edit.search, edit.replace
+        if "\r\n" in current:  # keep the file's Windows line endings
+            search = search.replace("\r\n", "\n").replace("\n", "\r\n")
+            replace = replace.replace("\r\n", "\n").replace("\n", "\r\n")
+        count = current.count(search)
         if count != 1:
             applied.problems.append(f"search text occurs {count} times in {edit.file}; it must occur exactly once")
             continue
-        new_contents[path] = current.replace(edit.search, edit.replace, 1)
+        new_contents[path] = current.replace(search, replace, 1)
 
     total = sum(_changed_lines(originals[p], c) for p, c in new_contents.items())
     if total > MAX_CHANGED_LINES:
@@ -67,7 +75,7 @@ def apply_patch(
     for path, content in new_contents.items():
         rel = path.relative_to(root.resolve()).as_posix()
         checkpoint.remember(path)
-        path.write_text(content, encoding="utf-8")
+        path.write_bytes(content.encode("utf-8"))  # bytes, so line endings stay exactly as they were
         applied.files.append(rel)
         diffs.append(
             "".join(
@@ -88,7 +96,7 @@ def _check_edit(root: Path, edit: Edit, allowed_prefixes: tuple[str, ...]) -> st
         path = confined(root, edit.file)
     except PathEscape as exc:
         return str(exc)
-    rel = edit.file.lstrip("./")
+    rel = relative(root, path)  # judge the real destination, not the string the model wrote
     if not rel.startswith(allowed_prefixes):
         return f"{edit.file} is outside {', '.join(allowed_prefixes)}; patches may only change production code"
     if not path.is_file():

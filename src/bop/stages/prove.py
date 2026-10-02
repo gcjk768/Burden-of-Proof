@@ -86,7 +86,11 @@ def prove(ctx: RunContext, group: FindingGroup, verdict: AnalysisVerdict) -> Pro
         placement.path.write_text(proof.source, encoding="utf-8")
         saved = ctx.write_artifact(group.id, f"proof-attempt-{attempt}.java", proof.source)
 
-        run = ctx.maven.test(ctx.workdir, selector=f"{proof.test_class}#{proof.test_method}", purpose="proof")
+        try:
+            run = ctx.maven.test(ctx.workdir, selector=f"{proof.test_class}#{proof.test_method}", purpose="proof")
+        except BaseException:
+            remove_file_and_empty_parents(placement.path, ctx.workdir)
+            raise
         outcome, detail = classify_proof(run.result, run.cases, proof.test_class, proof.test_method, ctx.marker)
         log = ctx.write_artifact(group.id, f"proof-attempt-{attempt}.log", run.result.output_tail(60_000))
         ctx.store.add_proof_test(

@@ -43,6 +43,7 @@ class Finding:
     snippet: str
     fingerprint: str
     in_scope: bool
+    base_fingerprint: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -126,6 +127,7 @@ def parse_sarif(data: dict[str, Any], *, known_rules: Iterable[str] = ()) -> lis
                     snippet=snippet,
                     fingerprint=fp,
                     in_scope=category in IN_SCOPE,
+                    base_fingerprint=base,
                 )
             )
     return findings

@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
 from bop.config import Settings
-from bop.errors import BudgetExceeded, ConfigError, ModelOutputError, ModelUnavailable
+from bop.errors import BudgetExceeded, ConfigError, ModelOutputError, ModelUnavailable, RateLimited
 from bop.llm.cache import ResponseCache, request_key
 from bop.llm.cost import Budget, PriceTable, estimate_tokens
 from bop.llm.router import Route, Router
@@ -42,6 +42,7 @@ class ChatResult:
     request_hash: str | None = None
     fallback_from: str | None = None
     call_id: int | None = None
+    malformed_tool_call: bool = False
 
     def assistant_message(self) -> Message:
         """The reply as a message to append to the conversation."""
@@ -118,6 +119,7 @@ class TokenFactoryClient:
         self.recorder = recorder
         self._sdk_factory = sdk_factory or self._default_sdk
         self._sdks: dict[str, Any] = {}
+        self._down: set[str] = set()
 
     def _default_sdk(self, base_url: str) -> Any:
         if not self.settings.api_key:
@@ -143,13 +145,19 @@ class TokenFactoryClient:
         context: dict[str, Any] | None = None,
     ) -> ChatResult:
         route = self.router.route(stage)
+        if route.fallback is not None and route.model in self._down:
+            return self._chat(route.fallback, messages, schema, tools, context or {}, fallback_from=route.model)
         try:
             return self._chat(route, messages, schema, tools, context or {})
         except ModelUnavailable:
             if route.fallback is None:
                 raise
-            result = self._chat(route.fallback, messages, schema, tools, context or {}, fallback_from=route.model)
-            return result
+            self._down.add(route.model)  # stay on the fallback for the rest of the run
+            return self._chat(route.fallback, messages, schema, tools, context or {}, fallback_from=route.model)
+
+    def forget(self, request_hash: str) -> None:
+        """Drop a cached reply that turned out to be unusable."""
+        self.cache.delete(request_hash)
 
     def chat_route(
         self,
@@ -235,7 +243,8 @@ class TokenFactoryClient:
         result.fallback_from = fallback_from
         result.cost_usd = self.prices.cost(route.model, result.usage.prompt_tokens, result.usage.completion_tokens)
         self.budget.add(result.cost_usd)
-        self.cache.put(key, request, _serialise(result))
+        if result.finish_reason != "length" and (result.content or result.tool_calls):
+            self.cache.put(key, request, _serialise(result))  # never cache a truncated or empty reply
         self._record(result, route, context, None)
         return result
 
@@ -243,6 +252,8 @@ class TokenFactoryClient:
     def _classify(exc: Exception) -> Exception:
         import openai
 
+        if isinstance(exc, openai.RateLimitError):
+            return RateLimited("Token Factory kept rate-limiting requests (429) after retries")
         if isinstance(exc, openai.AuthenticationError):
             return ConfigError("Token Factory rejected the API key (401). Check NEBIUS_API_KEY.")
         if isinstance(exc, openai.APIStatusError):
@@ -257,6 +268,8 @@ class TokenFactoryClient:
 
     @staticmethod
     def _parse(route: Route, response: Any) -> ChatResult:
+        if not getattr(response, "choices", None):
+            raise ModelOutputError(f"{route.model} returned no choices")
         choice = response.choices[0]
         message = choice.message
         content = strip_thinking(getattr(message, "content", None))
@@ -264,8 +277,10 @@ class TokenFactoryClient:
             ToolCall(tc.id, tc.function.name, parse_arguments(tc.function.arguments))
             for tc in (getattr(message, "tool_calls", None) or [])
         ]
+        malformed = False
         if not calls and "<tool_call>" in content:
             calls, content = parse_text_tool_calls(content)
+            malformed = not calls
         usage = getattr(response, "usage", None)
         details = getattr(usage, "completion_tokens_details", None) if usage else None
         return ChatResult(
@@ -280,4 +295,5 @@ class TokenFactoryClient:
                 reasoning_tokens=getattr(details, "reasoning_tokens", 0) or 0,
             ),
             finish_reason=getattr(choice, "finish_reason", None),
+            malformed_tool_call=malformed,
         )

@@ -52,8 +52,10 @@ def triage(ctx: RunContext, groups: Sequence[FindingGroup]) -> dict[str, TriageV
                 problems.append("each finding_id must appear exactly once")
             for v in result.verdicts:
                 problems += [f"{v.finding_id}: {p}" for p in check_triage(v)]
-                problems += [f"{v.finding_id}: {p}" for p in verify_all(ctx.workdir, v.evidence)[1]]
             return problems
+
+        def evidence_check(result: TriageBatch) -> list[str]:
+            return [f"{v.finding_id}: {p}" for v in result.verdicts for p in verify_all(ctx.workdir, v.evidence)[1]]
 
         messages = [
             {"role": "system", "content": prompt("triage")},
@@ -61,7 +63,9 @@ def triage(ctx: RunContext, groups: Sequence[FindingGroup]) -> dict[str, TriageV
         ]
         context = {"findings": [{"id": g.id, "key": g.primary.key} for g in batch]}
         try:
-            result, call = ask_structured(ctx.llm, "triage", messages, TriageBatch, context=context, check=check)
+            result, call = ask_structured(
+                ctx.llm, "triage", messages, TriageBatch, context=context, check=check, soft_check=evidence_check
+            )
         except ModelOutputError as exc:
             for g in batch:
                 ctx.store.set_group_state(g.id, "undetermined", f"triage failed: {exc}")

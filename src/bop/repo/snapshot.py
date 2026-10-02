@@ -2,11 +2,28 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
 
-IGNORED = shutil.ignore_patterns(".git", "target", "build", ".idea", ".vscode", "node_modules", "*.class", ".bop")
+from bop.errors import BopError, ConfigError
+
+_ALWAYS = shutil.ignore_patterns(".git", ".idea", ".vscode", "node_modules", "*.class", ".bop")
+_BUILD_OUTPUT = {"target", "build"}
+
+
+def _ignore(directory: str, names: list[str]) -> set[str]:
+    """Skip VCS and IDE folders everywhere, build output only next to a pom.xml, and every symlink.
+
+    Symlinks are never followed: a link in an untrusted repository could otherwise copy host
+    files (or the agent's own configuration) into the snapshot.
+    """
+    ignored = set(_ALWAYS(directory, names))
+    if "pom.xml" in names:
+        ignored |= _BUILD_OUTPUT & set(names)
+    ignored |= {n for n in names if os.path.islink(os.path.join(directory, n))}
+    return ignored
 
 
 def git_commit(repo: Path) -> str | None:
@@ -21,10 +38,19 @@ def git_commit(repo: Path) -> str | None:
 
 def snapshot(source: Path, dest: Path) -> str | None:
     """Copy ``source`` to ``dest`` (which must not exist). Returns the git commit if there is one."""
-    if not (source / "pom.xml").is_file():
-        raise FileNotFoundError(f"{source} has no pom.xml; only Maven projects are supported")
-    shutil.copytree(source, dest, ignore=IGNORED, symlinks=False)
+    check_maven_project(source)
+    try:
+        shutil.copytree(source, dest, ignore=_ignore, symlinks=True)
+    except (shutil.Error, OSError) as exc:
+        raise BopError(f"could not snapshot {source}: {exc}") from exc
     return git_commit(source)
+
+
+def check_maven_project(source: Path) -> None:
+    if not source.is_dir():
+        raise ConfigError(f"{source} is not a directory")
+    if not (source / "pom.xml").is_file():
+        raise ConfigError(f"{source} has no pom.xml; only Maven projects are supported")
 
 
 def remove_file_and_empty_parents(path: Path, stop: Path) -> None:

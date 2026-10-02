@@ -14,10 +14,21 @@ MAX_RESULT_CHARS = 14_000
 SKIP_DIRS = {".git", "target", "build", "node_modules", ".idea"}
 
 
-def _walk(root: Path, pattern: str) -> list[Path]:
+class BadArgument(ValueError):
+    pass
+
+
+def _walk(root: Path, pattern: str | None) -> list[Path]:
+    pattern = pattern or "**/*"
+    if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+        raise BadArgument("glob must be a relative pattern inside the repository")
     files = []
     for path in sorted(root.glob(pattern)):
-        if path.is_file() and not any(part in SKIP_DIRS for part in path.relative_to(root).parts):
+        try:
+            rel = path.resolve().relative_to(root)
+        except ValueError:
+            continue  # a symlink that points outside the repository
+        if path.is_file() and not any(part in SKIP_DIRS for part in rel.parts):
             files.append(path)
     return files
 
@@ -31,7 +42,7 @@ class RepoTools:
         self.root = root.resolve()
 
     # ------------------------------------------------------------------ tools
-    def list_files(self, glob: str = "**/*.java", limit: int = 300) -> str:
+    def list_files(self, glob: str | None = "**/*.java", limit: int = 300) -> str:
         files = [relative(self.root, p) for p in _walk(self.root, glob)]
         more = f"\n... {len(files) - limit} more" if len(files) > limit else ""
         return "\n".join(files[:limit]) + more if files else "no files match"
@@ -47,7 +58,7 @@ class RepoTools:
         footer = f"\n[{path}: lines {start}-{end} of {len(lines)}]"
         return body[:MAX_RESULT_CHARS] + footer
 
-    def search_code(self, pattern: str, glob: str = "**/*.java", max_results: int = 60) -> str:
+    def search_code(self, pattern: str, glob: str | None = "**/*.java", max_results: int = 60) -> str:
         try:
             regex = re.compile(pattern)
         except re.error as exc:
@@ -89,8 +100,10 @@ class RepoTools:
             return handler(**arguments)[:MAX_RESULT_CHARS]
         except PathEscape as exc:
             return f"error: {exc}"
-        except TypeError as exc:
+        except (TypeError, ValueError) as exc:
             return f"error: bad arguments for {name}: {exc}"
+        except Exception as exc:  # every tool is read-only; report the problem to the model instead
+            return f"error: {name} failed: {type(exc).__name__}: {exc}"
 
 
 def _fn(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:

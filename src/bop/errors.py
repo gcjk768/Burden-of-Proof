@@ -17,6 +17,10 @@ class ModelUnavailable(BopError):
     """The model answered with an error that retries will not fix (stopped, removed, overloaded)."""
 
 
+class RateLimited(ModelUnavailable):
+    """Token Factory kept answering 429 after the SDK's retries."""
+
+
 class ModelOutputError(BopError):
     """The model's reply could not be parsed or failed validation."""
 

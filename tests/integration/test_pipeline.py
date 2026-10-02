@@ -47,27 +47,29 @@ def finished_run(tmp_path_factory):
     summary = Pipeline(settings, log=logs.append).run(RunOptions(repo=APP, script=SCRIPT))
     db = sqlite3.connect(settings.db_path)
     db.row_factory = sqlite3.Row
-    yield summary, db, logs
+    yield summary, db, logs, settings
     db.close()
 
 
-def group_id(db, file_suffix: str, line: int) -> str:
+def group_id(db, file_suffix: str, line: int, run_id: str | None = None) -> str:
+    run_id = run_id or db.execute("SELECT id FROM runs ORDER BY created_at, rowid LIMIT 1").fetchone()["id"]
     row = db.execute(
-        "SELECT group_id FROM findings WHERE file LIKE ? AND start_line = ?", (f"%{file_suffix}", line)
+        "SELECT group_id FROM findings WHERE file LIKE ? AND start_line = ? AND run_id = ?",
+        (f"%{file_suffix}", line, run_id),
     ).fetchone()
     assert row, f"no finding at {file_suffix}:{line}"
     return row["group_id"]
 
 
 def test_run_completes_with_two_fixes_and_one_suppression(finished_run):
-    summary, _, logs = finished_run
+    summary, _, logs, _ = finished_run
     assert summary.status == "done", "\n".join(logs)
     assert summary.states == {"fixed": 2, "suppressed": 1}
     assert summary.report and summary.report.is_file()
 
 
 def test_sql_injection_was_proven_then_fixed_after_feedback(finished_run):
-    _, db, _ = finished_run
+    _, db, _, _ = finished_run
     gid = group_id(db, "AccountRepository.java", 26)
     proofs = [
         r["outcome"] for r in db.execute("SELECT outcome FROM proof_tests WHERE group_id = ? ORDER BY id", (gid,))
@@ -85,7 +87,7 @@ def test_sql_injection_was_proven_then_fixed_after_feedback(finished_run):
 
 
 def test_patch_that_only_silences_the_scanner_is_rejected(finished_run):
-    _, db, _ = finished_run
+    _, db, _, _ = finished_run
     gid = group_id(db, "ReportStore.java", 18)
     patches = db.execute("SELECT * FROM patches WHERE group_id = ? ORDER BY id", (gid,)).fetchall()
     assert [p["accepted"] for p in patches] == [0, 1]
@@ -95,7 +97,7 @@ def test_patch_that_only_silences_the_scanner_is_rejected(finished_run):
 
 
 def test_false_positive_is_suppressed_with_verified_evidence(finished_run):
-    summary, db, _ = finished_run
+    summary, db, _, _ = finished_run
     gid = group_id(db, "AccountRepository.java", 47)
     verdict = db.execute("SELECT * FROM verdicts WHERE group_id = ?", (gid,)).fetchone()
     assert verdict["verdict"] == "likely_false_positive" and verdict["evidence_ok"] == 1
@@ -104,7 +106,7 @@ def test_false_positive_is_suppressed_with_verified_evidence(finished_run):
 
 
 def test_only_dependency_resolution_had_network(finished_run):
-    _, db, _ = finished_run
+    _, db, _, _ = finished_run
     jobs = db.execute("SELECT purpose, network FROM runner_jobs").fetchall()
     online = [j["purpose"] for j in jobs if j["network"]]
     assert online == ["mvn test"]
@@ -112,7 +114,7 @@ def test_only_dependency_resolution_had_network(finished_run):
 
 
 def test_snapshot_is_left_exactly_as_it_was(finished_run):
-    summary, _, _ = finished_run
+    summary, _, _, _ = finished_run
     work = summary.run_dir / "work"
     original = {p.relative_to(APP) for p in APP.rglob("*") if p.is_file() and "target" not in p.parts}
     after = {p.relative_to(work) for p in work.rglob("*") if "target" not in p.relative_to(work).parts}
@@ -125,7 +127,41 @@ def test_snapshot_is_left_exactly_as_it_was(finished_run):
 
 
 def test_fix_diff_contains_patch_and_proof_test(finished_run):
-    summary, db, _ = finished_run
+    summary, db, _, _ = finished_run
     gid = group_id(db, "AccountRepository.java", 26)
     diff = (summary.run_dir / "groups" / gid / "fix.diff").read_text()
     assert "PreparedStatement" in diff and "AccountHandlerSqlInjectionBopProofTest" in diff
+
+
+def test_a_second_run_in_the_same_store_works(finished_run):
+    _, db, _, settings = finished_run
+    second = Pipeline(settings, log=lambda _: None).run(RunOptions(repo=APP, script=SCRIPT, estimate_only=True))
+    assert second.status == "estimated", second.message
+    assert second.estimate_usd and second.estimate_usd > 0
+    count = db.execute("SELECT COUNT(*) FROM finding_groups WHERE run_id = ?", (second.run_id,)).fetchone()[0]
+    assert count == 3
+
+
+class BudgetAtAnalysis:
+    """Replays the script but runs out of budget at the first deep-analysis call."""
+
+    def __init__(self):
+        from bop.llm.fake import ScriptedClient
+
+        self.inner = ScriptedClient.from_file(SCRIPT)
+
+    def chat(self, stage, messages, **kwargs):
+        from bop.errors import BudgetExceeded
+
+        if stage == "analyze":
+            raise BudgetExceeded("test cap reached")
+        return self.inner.chat(stage, messages, **kwargs)
+
+
+def test_budget_stop_keeps_triage_decisions_and_marks_the_finding_in_flight(finished_run):
+    _, _, _, settings = finished_run
+    run = Pipeline(settings, log=lambda _: None, llm=BudgetAtAnalysis()).run(RunOptions(repo=APP, script=SCRIPT))
+    assert run.status == "budget_stopped"
+    assert run.states.get("suppressed") == 1  # decided at triage, applied before the deep work
+    assert run.states.get("stopped") == 1
+    assert run.report and "budget cap reached" in run.report.read_text()

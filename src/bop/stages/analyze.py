@@ -18,6 +18,17 @@ from bop.stages.triage import store_evidence
 MAX_TOOL_TURNS = 12
 
 
+def _unfinished(result: ChatResult) -> str | None:
+    """Why a tool-free reply is not a usable conclusion, or None if it is one."""
+    if result.finish_reason == "length":
+        return "Your reply was cut off at the token limit. Continue, and keep the conclusion short."
+    if result.malformed_tool_call:
+        return "Your tool call could not be parsed. Call the tool again with valid arguments."
+    if not result.content.strip():
+        return "Your reply was empty. Either call a tool or give your conclusion."
+    return None
+
+
 def _investigate(ctx: RunContext, group: FindingGroup, triage: TriageVerdict | None) -> tuple[str, list[Any]]:
     finding = finding_payload(ctx.workdir, group.id, group.primary)
     intro = {"finding": finding, "triage": triage.model_dump() if triage else None}
@@ -45,7 +56,12 @@ def _investigate(ctx: RunContext, group: FindingGroup, triage: TriageVerdict | N
             }
         )
         if not result.tool_calls:
-            return result.content, transcript
+            problem = _unfinished(result)
+            if problem is None:
+                return result.content, transcript
+            messages.append(result.assistant_message())
+            messages.append({"role": "user", "content": problem})
+            continue
         messages.append(result.assistant_message())
         text_results = []
         for call in result.tool_calls:
@@ -64,15 +80,26 @@ def _investigate(ctx: RunContext, group: FindingGroup, triage: TriageVerdict | N
 
 
 def analyze(ctx: RunContext, group: FindingGroup, triage: TriageVerdict | None) -> AnalysisVerdict | None:
-    notes, transcript = _investigate(ctx, group, triage)
+    try:
+        notes, transcript = _investigate(ctx, group, triage)
+    except ModelOutputError as exc:
+        ctx.store.set_group_state(group.id, "undetermined", f"investigation failed: {exc}")
+        ctx.log(f"analyze: {group.id} investigation failed: {exc}")
+        return None
     ctx.write_artifact(group.id, "analysis-transcript.json", transcript)
+    if not notes.strip():
+        ctx.store.set_group_state(group.id, "undetermined", "the investigation produced no conclusion")
+        ctx.log(f"analyze: {group.id} produced no conclusion")
+        return None
 
     def check(v: AnalysisVerdict) -> list[str]:
         problems = check_analysis(v)
         if v.finding_id != group.id:
             problems.append(f"finding_id must be {group.id}")
-        problems += verify_all(ctx.workdir, v.evidence)[1]
         return problems
+
+    def evidence_check(v: AnalysisVerdict) -> list[str]:
+        return verify_all(ctx.workdir, v.evidence)[1]
 
     messages = [
         {"role": "system", "content": prompt("analyze_verdict")},
@@ -90,7 +117,13 @@ def analyze(ctx: RunContext, group: FindingGroup, triage: TriageVerdict | None) 
     context = {"key": group.primary.key, "group_id": group.id, "finding_id": group.id}
     try:
         verdict, call = ask_structured(
-            ctx.llm, "analyze_verdict", messages, AnalysisVerdict, context=context, check=check
+            ctx.llm,
+            "analyze_verdict",
+            messages,
+            AnalysisVerdict,
+            context=context,
+            check=check,
+            soft_check=evidence_check,
         )
     except ModelOutputError as exc:
         ctx.store.set_group_state(group.id, "undetermined", f"analysis failed: {exc}")

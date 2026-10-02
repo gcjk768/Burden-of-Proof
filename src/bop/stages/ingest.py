@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+from collections import Counter
+
 from bop.errors import BopError
 from bop.scanners.sarif import FindingGroup, group_findings
 from bop.scanners.semgrep import ScanResult, run_semgrep
@@ -27,7 +30,13 @@ def scan(ctx: RunContext, *, phase: str, group_id: str | None = None, attempt: i
 def ingest(ctx: RunContext) -> list[FindingGroup]:
     result = scan(ctx, phase="initial")
     groups = group_findings(result.findings)
-    ctx.initial_fingerprints = {f.fingerprint for f in result.findings}
+    ctx.initial_base_counts = Counter(f.base_fingerprint for f in result.findings)
+    # IDs come from the code, so the same repository scanned twice would collide; scope them to the run.
+    token = hashlib.sha256(ctx.run_id.encode()).hexdigest()[:6]
+    for group in groups:
+        group.id = f"{group.id}-{token}"
+        for f in group.members:
+            f.id = f"{f.id}-{token}"
     for group in groups:
         in_scope = group.primary.in_scope
         ctx.store.add_group(

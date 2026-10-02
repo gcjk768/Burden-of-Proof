@@ -10,10 +10,40 @@ from bop.llm.schemas import Evidence
 from bop.repo.paths import PathEscape, confined
 
 SLACK_LINES = 3  # models are often a line or two off; the excerpt must still match nearby
+_GUTTER = re.compile(r"(?m)^\s*\d+\s{2}")  # the "  42  " line-number column the tools add
 
 
 def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def strip_java_comments(text: str) -> str:
+    """Blank out // and /* */ comments, keeping string and char literals and every newline."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if ch == "/" and nxt == "/":
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+        elif ch == "/" and nxt == "*":
+            end = text.find("*/", i + 2)
+            end = n if end == -1 else end + 2
+            out.extend("\n" if c == "\n" else " " for c in text[i:end])
+            i = end
+        elif ch in "\"'":
+            quote, start = ch, i
+            i += 1
+            while i < n and text[i] != quote and text[i] != "\n":
+                i += 2 if text[i] == "\\" else 1
+            i = min(i + 1, n)
+            out.append(text[start:i])
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 
 @dataclass
@@ -31,19 +61,27 @@ def verify(root: Path, ev: Evidence) -> EvidenceCheck:
         return EvidenceCheck(False, str(exc))
     if not path.is_file():
         return EvidenceCheck(False, f"{ev.file} does not exist")
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    code_lines = strip_java_comments(text).splitlines() if path.suffix == ".java" else lines
     if ev.start_line > len(lines):
         return EvidenceCheck(False, f"{ev.file} has {len(lines)} lines; evidence starts at {ev.start_line}")
-    excerpt = _norm(ev.excerpt)
+    excerpt = _norm(_GUTTER.sub("", ev.excerpt))
     if not excerpt:
         return EvidenceCheck(False, f"empty excerpt for {ev.file}:{ev.start_line}")
     span = max(0, ev.end_line - ev.start_line)
     first = max(1, ev.start_line - SLACK_LINES)
     last = min(len(lines), ev.start_line + SLACK_LINES)
+    in_comment = False
     for start in [ev.start_line, *range(first, last + 1)]:
         end = min(len(lines), start + span)
         if excerpt in _norm("\n".join(lines[start - 1 : end])):
-            return EvidenceCheck(True, None, start, end)
+            if excerpt in _norm("\n".join(code_lines[start - 1 : end])):
+                return EvidenceCheck(True, None, start, end)
+            in_comment = True
+    if in_comment:
+        # Repository text can say anything; only code counts as evidence.
+        return EvidenceCheck(False, f"excerpt at {ev.file}:{ev.start_line} is inside a comment, not code")
     return EvidenceCheck(False, f"excerpt not found at {ev.file}:{ev.start_line}-{ev.end_line}: {ev.excerpt[:80]!r}")
 
 

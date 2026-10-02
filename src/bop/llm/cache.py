@@ -49,6 +49,9 @@ class ResponseCache:
         except (OSError, ValueError, KeyError):
             return None
 
+    def delete(self, key: str) -> None:
+        self._path(key).unlink(missing_ok=True)
+
     def put(self, key: str, request: dict[str, Any], response: dict[str, Any]) -> Path | None:
         if not self.writable:
             return None
