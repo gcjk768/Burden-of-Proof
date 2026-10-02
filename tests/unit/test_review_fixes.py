@@ -609,3 +609,50 @@ def test_evidence_counts_the_code_part_of_an_excerpt(tmp_path, start, end, excer
     assert check.ok is ok, check.problem
     if ok:
         assert "TODO" not in (check.code or "") and "build the statement" not in (check.code or "")
+
+
+# ---------------------------------------------------------------- host-side code never follows links a build planted
+def test_restore_replaces_a_planted_file_link_instead_of_writing_through_it(repo, tmp_path_factory):
+    outside = tmp_path_factory.mktemp("host") / "bashrc"
+    outside.write_text("HOST FILE")
+    target = (repo / SRC).resolve()
+    checkpoint = FileCheckpoint(repo)
+    checkpoint.remember(target)
+    original = target.read_bytes()
+    target.unlink()
+    target.symlink_to(outside)  # what a malicious test could do during the suite run
+    checkpoint.restore()
+    assert outside.read_text() == "HOST FILE"
+    assert not target.is_symlink() and target.read_bytes() == original
+
+
+def test_restore_refuses_a_planted_directory_link(repo, tmp_path_factory):
+    from bop.errors import SandboxError
+
+    host_dir = tmp_path_factory.mktemp("hostdir")
+    target = (repo / SRC).resolve()
+    checkpoint = FileCheckpoint(repo)
+    checkpoint.remember(target)
+    package = target.parent
+    for child in package.iterdir():
+        child.unlink()
+    package.rmdir()
+    package.symlink_to(host_dir)
+    with pytest.raises(SandboxError):
+        checkpoint.restore()
+    assert list(host_dir.iterdir()) == []
+
+
+def test_report_parsing_skips_links(tmp_path, tmp_path_factory):
+    from bop.java.surefire import parse_reports
+
+    host = tmp_path_factory.mktemp("host")
+    xml = '<testsuite><testcase classname="H" name="leak"><failure message="host secret"/></testcase></testsuite>'
+    (host / "TEST-host.xml").write_text(xml)
+    reports = tmp_path / "surefire-reports"
+    reports.mkdir()
+    (reports / "TEST-link.xml").symlink_to(host / "TEST-host.xml")
+    assert parse_reports(reports) == []
+    linked_dir = tmp_path / "linked-reports"
+    linked_dir.symlink_to(host)
+    assert parse_reports(linked_dir) == []

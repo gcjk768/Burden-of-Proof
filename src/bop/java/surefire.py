@@ -42,9 +42,13 @@ def _method_name(name: str) -> str:
 
 def parse_reports(directory: Path) -> list[TestCase]:
     cases: list[TestCase] = []
-    if not directory.is_dir():
+    # The reports are written by the target's build, so a report (or the directory) could be a link to
+    # a host file. This runs outside the sandbox, so links are never followed.
+    if directory.is_symlink() or not directory.is_dir():
         return cases
     for report in sorted(directory.glob("TEST-*.xml")):
+        if report.is_symlink() or not report.is_file():
+            continue
         try:
             root = ET.parse(report).getroot()  # noqa: S314
         except ET.ParseError:

@@ -7,7 +7,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from bop.errors import BopError, ConfigError
+from bop.errors import BopError, ConfigError, SandboxError
 
 _ALWAYS = shutil.ignore_patterns(".git", ".idea", ".vscode", "node_modules", "*.class", ".bop")
 _BUILD_OUTPUT = {"target", "build"}
@@ -78,11 +78,23 @@ class FileCheckpoint:
             self._saved[path] = path.read_bytes() if path.exists() else None
 
     def restore(self) -> None:
+        """Put every remembered file back, without following links planted since.
+
+        Builds of the target's code run between ``remember`` and ``restore`` with the snapshot
+        writable. A file swapped for a symlink is replaced by a regular file again. A parent directory
+        that now leads outside the snapshot stops the run, because writing there would write to the host.
+        """
+        root = os.path.realpath(self.root)
         for path, original in self._saved.items():
-            if original is None:
+            parent = os.path.realpath(path.parent)
+            if parent != os.path.abspath(path.parent) or not (parent == root or parent.startswith(root + os.sep)):
+                raise SandboxError(f"{path.parent} was replaced by a link during a build; refusing to restore it")
+            if path.is_symlink() or original is None:
                 path.unlink(missing_ok=True)
-            else:
-                path.write_bytes(original)
+            if original is not None:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(original)
         self._saved.clear()
 
     def forget(self) -> None:

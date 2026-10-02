@@ -38,6 +38,14 @@ Ubuntu runners. The command's environment no longer travels in the jail's argume
 user can read, because a proxy URL can carry a password. Bubblewrap would do the same job. We kept our own short jail so the sandbox has no extra
 system dependency and every step is tested here.
 
+**Host-side code never follows links a build planted.** (2 Oct 2026) Builds run with the snapshot
+writable, so the target's code can replace a file or directory with a symlink to a host path. Code
+outside the sandbox that touches the snapshot afterwards treats it as hostile. Restoring a patched file
+replaces a planted file link with a regular file instead of writing through it, and stops the run if a
+parent directory now leads outside the snapshot. Surefire reports that are links are skipped. Proof
+tests are written with `O_NOFOLLOW`. Reading tools and evidence checks already resolve every path and
+refuse anything outside the snapshot.
+
 **Network only for dependency resolution, and the project's tests never run online.** (verification,
 2 Oct 2026) The `prepare` step compiles main and test code with network on, but runs only a throwaway
 empty test class. Selecting it makes Surefire download the provider that matches the project's test
