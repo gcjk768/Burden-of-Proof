@@ -1,0 +1,376 @@
+{
+  "model": "scripted",
+  "note": "Recorded replies for tests/fixtures/tiny-java-app. First attempts contain realistic mistakes (a missing import, a search string that does not match) to exercise the feedback loops. The first path-traversal patch only normalises the path: it silences the scanner but leaves the hole open, and the proof test must reject it.",
+  "replies": [
+    {
+      "stage": "triage",
+      "verdicts": {
+        "src/main/java/com/example/bank/AccountRepository.java:26": {
+          "verdict": "needs_deep_analysis",
+          "confidence": 0.72,
+          "weakness": "sql_injection",
+          "summary": "The owner argument is concatenated into the SQL text; whether it is attacker-controlled depends on the callers.",
+          "evidence": [
+            {
+              "role": "propagation",
+              "file": "src/main/java/com/example/bank/AccountRepository.java",
+              "start_line": 23,
+              "end_line": 23,
+              "excerpt": "String sql = \"SELECT owner FROM \" + TABLE + \" WHERE owner = '\" + owner + \"'\";",
+              "why": "owner is concatenated into the query text"
+            },
+            {
+              "role": "sink",
+              "file": "src/main/java/com/example/bank/AccountRepository.java",
+              "start_line": 26,
+              "end_line": 26,
+              "excerpt": "ResultSet rs = stmt.executeQuery(sql)) {",
+              "why": "the concatenated text is executed"
+            }
+          ],
+          "false_positive_reason": null,
+          "reasoning": "No escaping or binding is visible; the caller decides whether owner is untrusted."
+        },
+        "src/main/java/com/example/bank/AccountRepository.java:47": {
+          "verdict": "likely_false_positive",
+          "confidence": 0.93,
+          "weakness": "sql_injection",
+          "summary": "The id is parsed with Integer.parseInt before it reaches the query, so only an integer can be concatenated.",
+          "evidence": [
+            {
+              "role": "sanitizer",
+              "file": "src/main/java/com/example/bank/AccountRepository.java",
+              "start_line": 45,
+              "end_line": 45,
+              "excerpt": "int id = Integer.parseInt(idParam);",
+              "why": "parseInt throws on anything that is not an integer"
+            },
+            {
+              "role": "sink",
+              "file": "src/main/java/com/example/bank/AccountRepository.java",
+              "start_line": 47,
+              "end_line": 47,
+              "excerpt": "ResultSet rs = stmt.executeQuery(\"SELECT owner FROM \" + TABLE + \" WHERE id = \" + id)) {",
+              "why": "only the int id and a constant table name reach the query"
+            }
+          ],
+          "false_positive_reason": "sanitized",
+          "reasoning": "An int rendered into SQL cannot carry quotes or keywords; the table name is a static final constant."
+        },
+        "src/main/java/com/example/bank/ReportStore.java:18": {
+          "verdict": "needs_deep_analysis",
+          "confidence": 0.68,
+          "weakness": "path_traversal",
+          "summary": "reportName is resolved against the base directory without normalisation or a containment check; callers decide whether it is untrusted.",
+          "evidence": [
+            {
+              "role": "sink",
+              "file": "src/main/java/com/example/bank/ReportStore.java",
+              "start_line": 18,
+              "end_line": 19,
+              "excerpt": "Path file = baseDir.resolve(reportName);\n        return Files.readString(file);",
+              "why": "the resolved path is read without checking it stays under baseDir"
+            }
+          ],
+          "false_positive_reason": null,
+          "reasoning": "A value like ../secret.txt would escape baseDir if it reaches this method."
+        }
+      }
+    },
+    {
+      "stage": "analyze",
+      "match": {
+        "key": "src/main/java/com/example/bank/AccountRepository.java:26"
+      },
+      "turns": [
+        {
+          "tool_calls": [
+            {
+              "name": "find_callers",
+              "arguments": {
+                "method": "findOwnersByName"
+              }
+            }
+          ]
+        },
+        {
+          "tool_calls": [
+            {
+              "name": "find_callers",
+              "arguments": {
+                "method": "search"
+              }
+            },
+            {
+              "name": "read_file",
+              "arguments": {
+                "path": "src/main/java/com/example/bank/web/AccountHandler.java"
+              }
+            }
+          ]
+        },
+        {
+          "content": "Verdict: reachable.\nPath: AccountHandler.java:17 (owner = queryParams.get(\"owner\"), an HTTP query parameter) -> AccountService.java:20 (strip only) -> AccountRepository.java:23 (concatenated into SQL) -> AccountRepository.java:26 (executeQuery).\nNothing on the path escapes or binds the value. A unit test can call AccountHandler.handle with owner = \"nobody' OR '1'='1\" against an H2 database and observe that every owner is returned."
+        }
+      ]
+    },
+    {
+      "stage": "analyze_verdict",
+      "match": {
+        "key": "src/main/java/com/example/bank/AccountRepository.java:26"
+      },
+      "turns": [
+        {
+          "json": {
+            "finding_id": "{finding_id}",
+            "verdict": "reachable",
+            "confidence": 0.95,
+            "weakness": "sql_injection",
+            "summary": "The HTTP query parameter 'owner' flows unmodified (apart from strip) into a concatenated SQL statement that is executed.",
+            "evidence": [
+              {
+                "role": "source",
+                "file": "src/main/java/com/example/bank/web/AccountHandler.java",
+                "start_line": 17,
+                "end_line": 17,
+                "excerpt": "String owner = queryParams.get(\"owner\");",
+                "why": "untrusted HTTP query parameter"
+              },
+              {
+                "role": "propagation",
+                "file": "src/main/java/com/example/bank/AccountService.java",
+                "start_line": 20,
+                "end_line": 20,
+                "excerpt": "return repository.findOwnersByName(ownerQuery.strip());",
+                "why": "only whitespace is removed"
+              },
+              {
+                "role": "propagation",
+                "file": "src/main/java/com/example/bank/AccountRepository.java",
+                "start_line": 23,
+                "end_line": 23,
+                "excerpt": "String sql = \"SELECT owner FROM \" + TABLE + \" WHERE owner = '\" + owner + \"'\";",
+                "why": "concatenated into the SQL text"
+              },
+              {
+                "role": "sink",
+                "file": "src/main/java/com/example/bank/AccountRepository.java",
+                "start_line": 26,
+                "end_line": 26,
+                "excerpt": "ResultSet rs = stmt.executeQuery(sql)) {",
+                "why": "executed as a plain Statement"
+              }
+            ],
+            "taint_path": [
+              "src/main/java/com/example/bank/web/AccountHandler.java:17",
+              "src/main/java/com/example/bank/AccountService.java:20",
+              "src/main/java/com/example/bank/AccountRepository.java:23",
+              "src/main/java/com/example/bank/AccountRepository.java:26"
+            ],
+            "false_positive_reason": null,
+            "reasoning": "No parameter binding, escaping or allow-list exists between the request and the query.",
+            "suggested_proof": "Call AccountHandler.handle with owner = \"nobody' OR '1'='1\" on an H2 database holding two accounts and assert that nothing is returned."
+          }
+        }
+      ]
+    },
+    {
+      "stage": "prove",
+      "match": {
+        "key": "src/main/java/com/example/bank/AccountRepository.java:26"
+      },
+      "turns": [
+        {
+          "json": {
+            "test_path": "src/test/java/com/example/bank/web/AccountHandlerSqlInjectionBopProofTest.java",
+            "test_class": "com.example.bank.web.AccountHandlerSqlInjectionBopProofTest",
+            "test_method": "ownerParameterCannotWidenTheQuery",
+            "source": "package com.example.bank.web;\n\nimport static org.junit.jupiter.api.Assertions.assertEquals;\n\nimport com.example.bank.AccountRepository;\nimport com.example.bank.AccountService;\nimport java.sql.Connection;\nimport java.sql.DriverManager;\nimport java.sql.Statement;\nimport org.junit.jupiter.api.Test;\n\nclass AccountHandlerSqlInjectionBopProofTest {\n\n    @Test\n    void ownerParameterCannotWidenTheQuery() throws Exception {\n        try (Connection connection = DriverManager.getConnection(\"jdbc:h2:mem:bop_proof_sqli;DB_CLOSE_DELAY=-1\")) {\n            try (Statement stmt = connection.createStatement()) {\n                stmt.execute(\"CREATE TABLE accounts (id INT, owner VARCHAR(64))\");\n                stmt.execute(\"INSERT INTO accounts VALUES (1, 'alice'), (2, 'bob')\");\n            }\n            AccountHandler handler = new AccountHandler(new AccountService(new AccountRepository(connection)));\n            String result = handler.handle(Map.of(\"owner\", \"nobody' OR '1'='1\"));\n            assertEquals(\"\", result,\n                \"[BOP-PROOF] attacker-controlled owner parameter changed the SQL query and returned other users' accounts\");\n        }\n    }\n}\n",
+            "setup_notes": "H2 in memory with two accounts."
+          }
+        },
+        {
+          "json": {
+            "test_path": "src/test/java/com/example/bank/web/AccountHandlerSqlInjectionBopProofTest.java",
+            "test_class": "com.example.bank.web.AccountHandlerSqlInjectionBopProofTest",
+            "test_method": "ownerParameterCannotWidenTheQuery",
+            "source": "package com.example.bank.web;\n\nimport static org.junit.jupiter.api.Assertions.assertEquals;\n\nimport com.example.bank.AccountRepository;\nimport com.example.bank.AccountService;\nimport java.sql.Connection;\nimport java.sql.DriverManager;\nimport java.sql.Statement;\nimport java.util.Map;\nimport org.junit.jupiter.api.Test;\n\nclass AccountHandlerSqlInjectionBopProofTest {\n\n    @Test\n    void ownerParameterCannotWidenTheQuery() throws Exception {\n        try (Connection connection = DriverManager.getConnection(\"jdbc:h2:mem:bop_proof_sqli;DB_CLOSE_DELAY=-1\")) {\n            try (Statement stmt = connection.createStatement()) {\n                stmt.execute(\"CREATE TABLE accounts (id INT, owner VARCHAR(64))\");\n                stmt.execute(\"INSERT INTO accounts VALUES (1, 'alice'), (2, 'bob')\");\n            }\n            AccountHandler handler = new AccountHandler(new AccountService(new AccountRepository(connection)));\n            String result = handler.handle(Map.of(\"owner\", \"nobody' OR '1'='1\"));\n            assertEquals(\"\", result,\n                \"[BOP-PROOF] attacker-controlled owner parameter changed the SQL query and returned other users' accounts\");\n        }\n    }\n}\n",
+            "setup_notes": "Added the missing java.util.Map import."
+          }
+        }
+      ]
+    },
+    {
+      "stage": "fix",
+      "match": {
+        "key": "src/main/java/com/example/bank/AccountRepository.java:26"
+      },
+      "turns": [
+        {
+          "json": {
+            "edits": [
+              {
+                "file": "src/main/java/com/example/bank/AccountRepository.java",
+                "search": "String sql = \"SELECT owner FROM \" + TABLE + \" WHERE owner = '\" + owner + \"';",
+                "replace": "String sql = \"SELECT owner FROM \" + TABLE + \" WHERE owner = ?\";"
+              }
+            ],
+            "explanation": "Bind the owner as a parameter.",
+            "risk_notes": ""
+          }
+        },
+        {
+          "json": {
+            "edits": [
+              {
+                "file": "src/main/java/com/example/bank/AccountRepository.java",
+                "search": "import java.sql.Connection;\n",
+                "replace": "import java.sql.Connection;\nimport java.sql.PreparedStatement;\n"
+              },
+              {
+                "file": "src/main/java/com/example/bank/AccountRepository.java",
+                "search": "        String sql = \"SELECT owner FROM \" + TABLE + \" WHERE owner = '\" + owner + \"'\";\n        List<String> owners = new ArrayList<>();\n        try (Statement stmt = connection.createStatement();\n             ResultSet rs = stmt.executeQuery(sql)) {\n            while (rs.next()) {\n                owners.add(rs.getString(\"owner\"));\n            }\n        }\n        return owners;",
+                "replace": "        String sql = \"SELECT owner FROM \" + TABLE + \" WHERE owner = ?\";\n        List<String> owners = new ArrayList<>();\n        try (PreparedStatement stmt = connection.prepareStatement(sql)) {\n            stmt.setString(1, owner);\n            try (ResultSet rs = stmt.executeQuery()) {\n                while (rs.next()) {\n                    owners.add(rs.getString(\"owner\"));\n                }\n            }\n        }\n        return owners;"
+              }
+            ],
+            "explanation": "Use a PreparedStatement and bind owner as a parameter, so the value can never change the SQL text.",
+            "risk_notes": "Behaviour for legitimate names is unchanged; the table name stays a constant."
+          }
+        }
+      ]
+    },
+    {
+      "stage": "analyze",
+      "match": {
+        "key": "src/main/java/com/example/bank/ReportStore.java:18"
+      },
+      "turns": [
+        {
+          "tool_calls": [
+            {
+              "name": "find_callers",
+              "arguments": {
+                "method": "read"
+              }
+            }
+          ]
+        },
+        {
+          "tool_calls": [
+            {
+              "name": "read_file",
+              "arguments": {
+                "path": "src/main/java/com/example/bank/web/ReportHandler.java"
+              }
+            }
+          ]
+        },
+        {
+          "content": "Verdict: reachable.\nPath: ReportHandler.java:17 (queryParams.get(\"report\"), an HTTP query parameter) -> ReportStore.java:18 (baseDir.resolve(reportName), no normalisation or prefix check) -> ReportStore.java:19 (Files.readString).\nA test can create a reports directory with a secret file beside it and request ../secret.txt through ReportHandler."
+        }
+      ]
+    },
+    {
+      "stage": "analyze_verdict",
+      "match": {
+        "key": "src/main/java/com/example/bank/ReportStore.java:18"
+      },
+      "turns": [
+        {
+          "json": {
+            "finding_id": "{finding_id}",
+            "verdict": "reachable",
+            "confidence": 0.94,
+            "weakness": "path_traversal",
+            "summary": "The HTTP query parameter 'report' is resolved against the reports directory and read without checking that the result stays inside it.",
+            "evidence": [
+              {
+                "role": "source",
+                "file": "src/main/java/com/example/bank/web/ReportHandler.java",
+                "start_line": 17,
+                "end_line": 17,
+                "excerpt": "return store.read(queryParams.get(\"report\"));",
+                "why": "untrusted HTTP query parameter"
+              },
+              {
+                "role": "propagation",
+                "file": "src/main/java/com/example/bank/ReportStore.java",
+                "start_line": 18,
+                "end_line": 18,
+                "excerpt": "Path file = baseDir.resolve(reportName);",
+                "why": "resolve accepts ../ segments and absolute paths"
+              },
+              {
+                "role": "sink",
+                "file": "src/main/java/com/example/bank/ReportStore.java",
+                "start_line": 19,
+                "end_line": 19,
+                "excerpt": "return Files.readString(file);",
+                "why": "reads whatever file the path points to"
+              }
+            ],
+            "taint_path": [
+              "src/main/java/com/example/bank/web/ReportHandler.java:17",
+              "src/main/java/com/example/bank/ReportStore.java:18",
+              "src/main/java/com/example/bank/ReportStore.java:19"
+            ],
+            "false_positive_reason": null,
+            "reasoning": "There is no normalize() followed by startsWith(baseDir), and no allow-list of report names.",
+            "suggested_proof": "Request ../secret.txt through ReportHandler and assert that the secret file outside the reports directory is not returned."
+          }
+        }
+      ]
+    },
+    {
+      "stage": "prove",
+      "match": {
+        "key": "src/main/java/com/example/bank/ReportStore.java:18"
+      },
+      "turns": [
+        {
+          "json": {
+            "test_path": "src/test/java/com/example/bank/web/ReportHandlerPathTraversalBopProofTest.java",
+            "test_class": "com.example.bank.web.ReportHandlerPathTraversalBopProofTest",
+            "test_method": "reportNameCannotEscapeTheReportsDirectory",
+            "source": "package com.example.bank.web;\n\nimport static org.junit.jupiter.api.Assertions.assertNotEquals;\n\nimport com.example.bank.ReportStore;\nimport java.io.IOException;\nimport java.nio.file.Files;\nimport java.nio.file.Path;\nimport java.util.Map;\nimport org.junit.jupiter.api.Test;\nimport org.junit.jupiter.api.io.TempDir;\n\nclass ReportHandlerPathTraversalBopProofTest {\n\n    @TempDir\n    Path tempDir;\n\n    @Test\n    void reportNameCannotEscapeTheReportsDirectory() throws Exception {\n        Path reports = Files.createDirectory(tempDir.resolve(\"reports\"));\n        Files.writeString(tempDir.resolve(\"secret.txt\"), \"top secret\");\n        ReportHandler handler = new ReportHandler(new ReportStore(reports));\n        String leaked = null;\n        try {\n            leaked = handler.handle(Map.of(\"report\", \"../secret.txt\"));\n        } catch (IllegalArgumentException | SecurityException | IOException rejected) {\n            // Refusing the request is the safe behaviour.\n        }\n        assertNotEquals(\"top secret\", leaked,\n            \"[BOP-PROOF] report name escaped the reports directory and read a file outside it\");\n    }\n}\n",
+            "setup_notes": "A temporary reports directory with a secret file next to it."
+          }
+        }
+      ]
+    },
+    {
+      "stage": "fix",
+      "match": {
+        "key": "src/main/java/com/example/bank/ReportStore.java:18"
+      },
+      "turns": [
+        {
+          "json": {
+            "edits": [
+              {
+                "file": "src/main/java/com/example/bank/ReportStore.java",
+                "search": "        Path file = baseDir.resolve(reportName);",
+                "replace": "        Path file = baseDir.resolve(reportName).normalize();"
+              }
+            ],
+            "explanation": "Normalise the path before reading it.",
+            "risk_notes": ""
+          }
+        },
+        {
+          "json": {
+            "edits": [
+              {
+                "file": "src/main/java/com/example/bank/ReportStore.java",
+                "search": "        Path file = baseDir.resolve(reportName);\n        return Files.readString(file);",
+                "replace": "        Path base = baseDir.toAbsolutePath().normalize();\n        Path file = base.resolve(reportName).normalize();\n        if (!file.startsWith(base)) {\n            throw new IllegalArgumentException(\"report name must stay inside the reports directory\");\n        }\n        return Files.readString(file);"
+              }
+            ],
+            "explanation": "Normalise the resolved path and reject anything that is not inside the reports directory.",
+            "risk_notes": "Report names containing ../ that still land inside the directory keep working."
+          }
+        }
+      ]
+    }
+  ]
+}
