@@ -1,0 +1,21 @@
+# Secrets
+.env
+*.env
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# Burden of Proof working data: runs, caches, Maven repository
+.bop/
+runs/
+
+# Java build output, including inside fixtures
+target/

@@ -1,0 +1,52 @@
+[project]
+name = "burden-of-proof"
+version = "0.1.0"
+description = "Makes every security finding prove itself: triage, trace, prove with a failing test, fix, and report."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{ name = "Burden of Proof contributors" }]
+dependencies = [
+  "openai>=3.23,<4",
+  "pydantic>=2.13,<3",
+  "httpx>=0.28",
+  "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+scan = ["semgrep==1.179.0"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+bop = "bop.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bop"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "integration: needs Java 17+, Maven, Semgrep and Linux user namespaces",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF"]
+ignore = [
+  "S101",   # assert is fine in tests and invariants
+  "S603",   # subprocess without shell is the point of the runner
+  "S607",   # tools are resolved from PATH on purpose
+  "RUF001", "RUF002", "RUF003",  # typographic characters in prose
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B011"]
